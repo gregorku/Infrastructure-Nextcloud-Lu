@@ -1,0 +1,76 @@
+###############################################################################
+#
+# Metabase and its own PostgreSQL. Port 3000 is not published.
+# The application is reached only through the admin Traefik router.
+#
+###############################################################################
+
+services:
+  metabase-postgresql:
+    image: ${METABASE_POSTGRES_IMAGE:?METABASE_POSTGRES_IMAGE}
+    container_name: lu-metabase-postgresql
+    hostname: lu-metabase-postgresql
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_DB: ${METABASE_DB_NAME}
+      POSTGRES_USER: ${METABASE_DB_USER}
+      POSTGRES_PASSWORD: ${METABASE_DB_PASSWORD}
+      TZ: ${TZ}
+    volumes:
+      - ${DATA_DIR}/metabase/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - lu-internal
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE}
+        max-file: "${LOG_MAX_FILES}"
+
+  metabase:
+    image: ${METABASE_IMAGE:?METABASE_IMAGE}
+    container_name: lu-metabase
+    hostname: lu-metabase
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      metabase-postgresql:
+        condition: service_healthy
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: ${METABASE_DB_NAME}
+      MB_DB_HOST: metabase-postgresql
+      MB_DB_PORT: "5432"
+      MB_DB_USER: ${METABASE_DB_USER}
+      MB_DB_PASS: ${METABASE_DB_PASSWORD}
+      MB_SITE_URL: ${METABASE_SITE_URL}
+      TZ: ${TZ}
+    volumes:
+      - ${DATA_DIR}/metabase/data:/metabase-data
+      - ${DATA_DIR}/metabase/plugins:/plugins
+    networks:
+      lu-internal: {}
+      lu-proxy: {}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "bash -c 'exec 3<>/dev/tcp/127.0.0.1/3000'"
+      interval: 20s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE}
+        max-file: "${LOG_MAX_FILES}"

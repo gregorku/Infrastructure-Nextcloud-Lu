@@ -1,0 +1,13 @@
+.env
+.env.bak-*
+.env.tmp
+runtime/
+*.tar
+*.tar.gz
+*.tar.age
+*.tar.gz.age
+*.sha256
+*.dump
+acme.json
+dashboard.htpasswd
+BOUNCER_KEY_*

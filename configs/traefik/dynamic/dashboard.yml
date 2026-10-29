@@ -1,0 +1,12 @@
+http:
+  routers:
+    traefik-dashboard:
+      entryPoints:
+        - admin
+      rule: "PathPrefix(`/api`) || PathPrefix(`/dashboard`)"
+      service: api@internal
+      middlewares:
+        - default-chain
+      tls:
+        options: default
+      priority: 100

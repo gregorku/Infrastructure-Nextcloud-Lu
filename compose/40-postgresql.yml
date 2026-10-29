@@ -1,0 +1,39 @@
+###############################################################################
+#
+# PostgreSQL 18 for Nextcloud only. No host port.
+# PGDATA layout matches the official 18 image.
+# The bootstrap role stays SUPERUSER. deploy.sh creates PG_USER.
+#
+###############################################################################
+
+services:
+  postgresql:
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE}
+    container_name: lu-postgresql
+    hostname: lu-postgresql
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_DB: ${PG_DB}
+      POSTGRES_USER: nc_bootstrap
+      POSTGRES_PASSWORD: ${PG_PASS}
+      PGDATA: /var/lib/postgresql/18/docker
+      POSTGRES_INITDB_ARGS: --data-checksums
+    volumes:
+      - ${POSTGRESQL_HOST_DIR:?POSTGRESQL_HOST_DIR}:/var/lib/postgresql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -d "$$POSTGRES_DB" -U "$$POSTGRES_USER" || pg_isready -d "$$POSTGRES_DB"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks:
+      - lu-internal
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE}
+        max-file: "${LOG_MAX_FILES}"

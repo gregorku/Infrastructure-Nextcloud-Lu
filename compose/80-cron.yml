@@ -1,0 +1,68 @@
+###############################################################################
+#
+# Cron uses the same image as PHP-FPM and does not upgrade it.
+#
+###############################################################################
+
+services:
+  cron:
+    image: ${NEXTCLOUD_IMAGE:?NEXTCLOUD_IMAGE}:${NEXTCLOUD_TAG:?NEXTCLOUD_TAG}
+    container_name: lu-cron
+    hostname: lu-cron
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - /cron.sh
+    environment:
+      POSTGRES_HOST: postgresql
+      POSTGRES_DB: ${PG_DB}
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASS}
+      NC_setup_create_db_user: "false"
+      NEXTCLOUD_DATA_DIR: /var/www/html/data
+      REDIS_HOST: redis
+      REDIS_HOST_PORT: "6379"
+      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD}
+      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT}
+      PHP_UPLOAD_LIMIT: ${PHP_UPLOAD_LIMIT}
+      PHP_OPCACHE_MEMORY_CONSUMPTION: ${PHP_OPCACHE_MEMORY_CONSUMPTION}
+      NEXTCLOUD_UPDATE: "0"
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-tls}
+      SMTP_NAME: ${SMTP_NAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:-}
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-}
+    volumes:
+      - ${NEXTCLOUD_HTML_HOST_DIR}:/var/www/html
+      - ${NEXTCLOUD_DATA_HOST_DIR}:/var/www/html/data
+    depends_on:
+      nextcloud:
+        condition: service_healthy
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          tr '\0' ' ' < /proc/1/cmdline
+          | grep -F -q 'busybox crond'
+          && tr '\0' ' ' < /proc/1/cmdline
+          | grep -F -v -q 'cron.sh'
+          && su -s /bin/bash www-data -c 'php /var/www/html/occ status'
+          | grep -Eq 'installed:[[:space:]]*true'
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    networks:
+      - lu-internal
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE}
+        max-file: "${LOG_MAX_FILES}"

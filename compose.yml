@@ -1,0 +1,22 @@
+###############################################################################
+#
+# Infrastructure-Nextcloud-Lu
+#
+# One Compose project for the home Incus container.
+# Traefik is the only service meant to publish host ports.
+#
+###############################################################################
+
+name: infrastructure-nextcloud-lu
+
+include:
+  - compose/00-networks.yml
+  - compose/10-traefik.yml
+  - compose/15-traefik-admin-port.yml
+  - compose/20-crowdsec.yml
+  - compose/30-metabase.yml
+  - compose/40-postgresql.yml
+  - compose/50-redis.yml
+  - compose/60-nextcloud-fpm.yml
+  - compose/70-nginx.yml
+  - compose/80-cron.yml

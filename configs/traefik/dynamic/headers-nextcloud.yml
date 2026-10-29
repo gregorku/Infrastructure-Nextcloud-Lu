@@ -1,0 +1,22 @@
+http:
+  middlewares:
+    nextcloud-headers:
+      headers:
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        customResponseHeaders:
+          X-Robots-Tag: "noindex,nofollow"
+          Server: ""
+          X-Permitted-Cross-Domain-Policies: "none"
+        permissionsPolicy: >-
+          accelerometer=(),
+          geolocation=(),
+          gyroscope=(),
+          magnetometer=(),
+          payment=(),
+          usb=(),
+          interest-cohort=()

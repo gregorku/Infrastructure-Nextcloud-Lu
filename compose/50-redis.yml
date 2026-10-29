@@ -1,0 +1,37 @@
+###############################################################################
+#
+# Redis for cache and file locking. No host port.
+# The password is in the rendered config file, not on the command line.
+#
+###############################################################################
+
+services:
+  redis:
+    image: ${REDIS_IMAGE:?REDIS_IMAGE}
+    container_name: lu-redis
+    hostname: lu-redis
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - redis-server
+      - /usr/local/etc/redis/redis.conf
+    volumes:
+      - ${REDIS_CONFIG_FILE:?REDIS_CONFIG_FILE}:/usr/local/etc/redis/redis.conf:ro
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli --no-auth-warning -a "$$REDIS_PASSWORD" ping | grep -q PONG
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - lu-internal
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE}
+        max-file: "${LOG_MAX_FILES}"

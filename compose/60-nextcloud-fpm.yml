@@ -1,0 +1,73 @@
+###############################################################################
+#
+# Nextcloud PHP-FPM. Port 9000 stays on lu-internal.
+# The image entrypoint may install only while version.php is absent.
+# deploy.sh refuses a tag that differs from state/installed-version.
+#
+###############################################################################
+
+services:
+  nextcloud:
+    image: ${NEXTCLOUD_IMAGE:?NEXTCLOUD_IMAGE}:${NEXTCLOUD_TAG:?NEXTCLOUD_TAG}
+    container_name: lu-nextcloud
+    hostname: lu-nextcloud
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_HOST: postgresql
+      POSTGRES_DB: ${PG_DB}
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASS}
+      NC_setup_create_db_user: "false"
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD}
+      NEXTCLOUD_DATA_DIR: /var/www/html/data
+      NEXTCLOUD_TRUSTED_DOMAINS: ${NEXTCLOUD_TRUSTED_DOMAINS}
+      REDIS_HOST: redis
+      REDIS_HOST_PORT: "6379"
+      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES}
+      OVERWRITEPROTOCOL: ${OVERWRITEPROTOCOL}
+      OVERWRITEHOST: ${OVERWRITEHOST}
+      OVERWRITECLIURL: ${OVERWRITECLIURL}
+      FORWARDED_FOR_HEADERS: ${FORWARDED_FOR_HEADERS}
+      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT}
+      PHP_UPLOAD_LIMIT: ${PHP_UPLOAD_LIMIT}
+      PHP_OPCACHE_MEMORY_CONSUMPTION: ${PHP_OPCACHE_MEMORY_CONSUMPTION}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-tls}
+      SMTP_NAME: ${SMTP_NAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:-}
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-}
+    volumes:
+      - ${NEXTCLOUD_HTML_HOST_DIR}:/var/www/html
+      - ${NEXTCLOUD_DATA_HOST_DIR}:/var/www/html/data
+      - ../configs/nextcloud/hooks/10-apcu.sh:/docker-entrypoint-hooks.d/post-installation/10-apcu.sh:ro
+      - ../configs/nextcloud/hooks/10-apcu.sh:/docker-entrypoint-hooks.d/post-upgrade/10-apcu.sh:ro
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          php -r 'exit(@fsockopen("127.0.0.1", 9000) ? 0 : 1);'
+          && su -s /bin/bash www-data -c 'php /var/www/html/occ status'
+          | grep -Eq 'installed:[[:space:]]*true'
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 180s
+    networks:
+      - lu-internal
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE}
+        max-file: "${LOG_MAX_FILES}"

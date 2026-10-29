@@ -1,0 +1,7 @@
+tls:
+  stores:
+    default: {}
+  options:
+    default:
+      minVersion: VersionTLS12
+      sniStrict: false

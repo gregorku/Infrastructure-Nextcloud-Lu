@@ -1,0 +1,15 @@
+###############################################################################
+#
+# External networks. deploy.sh creates them from .env.
+# Compose does not own their IPAM and must not replace them.
+#
+###############################################################################
+
+networks:
+  lu-proxy:
+    name: lu-proxy
+    external: true
+
+  lu-internal:
+    name: lu-internal
+    external: true
