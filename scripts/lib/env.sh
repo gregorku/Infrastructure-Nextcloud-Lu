@@ -43,8 +43,8 @@ ENV_POLICY[TRAEFIK_TLS_MODE]="user"
 ENV_POLICY[TRAEFIK_ACME_EMAIL]="user"
 ENV_POLICY[TRAEFIK_ADMIN_PUBLISH]="user"
 ENV_POLICY[ADMIN_IP_ALLOWLIST]="user"
-ENV_POLICY[METABASE_HOST]="user"
-ENV_POLICY[METABASE_SITE_URL]="user"
+ENV_POLICY[METABASE_IP_ALLOWLIST]="user"
+ENV_POLICY[METABASE_PUBLIC_URL]="framework"
 ENV_POLICY[METABASE_DB_NAME]="framework"
 ENV_POLICY[METABASE_DB_USER]="framework"
 ENV_POLICY[METABASE_DB_PASSWORD]="generated"
@@ -307,11 +307,18 @@ env_validate_runtime() {
         env_ip_private "${allow%/*}" || fail "ADMIN_IP_ALLOWLIST must be a private range."
     done
 
-    [[ "${env_ref[METABASE_HOST]}" != "${NEXTCLOUD_DOMAIN}" ]] || fail "METABASE_HOST must not be the public Nextcloud domain."
-    [[ "${env_ref[METABASE_HOST]}" =~ ^[A-Za-z0-9.-]+$ ]] || fail "METABASE_HOST contains unsupported characters."
-    [[ "${env_ref[METABASE_SITE_URL]}" == "https://${env_ref[METABASE_HOST]}" || "${env_ref[METABASE_SITE_URL]}" == "https://${env_ref[METABASE_HOST]}/" || "${env_ref[METABASE_SITE_URL]}" =~ ^https://${env_ref[METABASE_HOST]}:[0-9]+/?$ ]] \
-        || fail "METABASE_SITE_URL must be https on METABASE_HOST."
-    [[ "${env_ref[METABASE_SITE_URL]}" != *"${NEXTCLOUD_DOMAIN}"* ]] || fail "METABASE_SITE_URL must not use the Nextcloud domain."
+    [[ -n "${env_ref[METABASE_IP_ALLOWLIST]}" ]] || fail "METABASE_IP_ALLOWLIST is empty."
+    local metabase_allow
+    for metabase_allow in ${env_ref[METABASE_IP_ALLOWLIST]}; do
+        env_cidr_ok "${metabase_allow}" || fail "Invalid METABASE_IP_ALLOWLIST CIDR: ${metabase_allow}"
+        [[ "${metabase_allow}" != "0.0.0.0/0" ]] || fail "METABASE_IP_ALLOWLIST must not be 0.0.0.0/0."
+        env_ip_private "${metabase_allow%/*}" || fail "METABASE_IP_ALLOWLIST must be a private range."
+    done
+
+    [[ "${env_ref[METABASE_PUBLIC_URL]}" == "https://10.100.100.1:9444" ]] \
+        || fail "METABASE_PUBLIC_URL must be https://10.100.100.1:9444."
+    [[ "${env_ref[METABASE_PUBLIC_URL]}" != *"${NEXTCLOUD_DOMAIN}"* ]] \
+        || fail "METABASE_PUBLIC_URL must not use the Nextcloud domain."
 
     [[ -f "${HTPASSWD_FILE}" ]] || fail "Dashboard BasicAuth file is missing. Run ./scripts/create-dashboard-user.sh before deploy."
 

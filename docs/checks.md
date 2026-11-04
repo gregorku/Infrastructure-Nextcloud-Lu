@@ -10,7 +10,7 @@ Samotné spuštění kontejnerů ochranu nedokazuje. Po `post-deploy.sh` v konte
 6. V režimu `local` Traefik používá výchozí certifikát. HTTP-01 se ověřuje až po průchodu veřejného portu 80 na entrypoint `web`.
 7. `PROPFIND` na WebDAV s heslem aplikace Nextcloudu musí projít bez BasicAuth Traefiku.
 8. Velký upload ověř až po úpravě timeoutu HAProxy. Limit Traefiku je 16G a `readTimeout` na `websecure` je `0s`.
-9. Dashboard a Metabase na veřejném portu 443 pro `ludek.serveftp.net` nemají odpovídat. Patří na entrypoint `admin` a vyžadují whitelist i BasicAuth. Metabase potom ještě vlastní heslo.
+9. Dashboard Traefiku patří na entrypoint `admin` a port `8443`. Na veřejném portu 443 pro `ludek.serveftp.net` nemá odpovídat. Metabase patří na entrypoint `metabase`, hostitelský bind `192.168.12.233:8444` a adresu `https://10.100.100.1:9444`. Vyžaduje `METABASE_IP_ALLOWLIST`, BasicAuth a vlastní přihlášení Metabase.
 10. `ss` nebo `docker ps` na hostiteli kontejneru nemá ukazovat publikované porty 5432, 6379, 9000 ani 3000.
 11. Healthcheck Metabase ověřuje jen otevřený port 3000 uvnitř kontejneru. Odpověď `/api/health` ověř zvlášť z kontejneru v síti `lu-proxy`.
 

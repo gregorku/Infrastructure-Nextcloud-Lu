@@ -155,6 +155,10 @@ EOF
         for item in ${RUNTIME_ENV[ADMIN_IP_ALLOWLIST]}; do
             printf '          - "%s"\n' "$(yaml_quote "${item}")"
         done
+        printf '    metabase-ip-whitelist:\n      ipAllowList:\n        sourceRange:\n'
+        for item in ${RUNTIME_ENV[METABASE_IP_ALLOWLIST]}; do
+            printf '          - "%s"\n' "$(yaml_quote "${item}")"
+        done
     } > "${allow}"
 
     local tls_block="        options: default"
@@ -179,27 +183,6 @@ ${tls_block}
         passHostHeader: true
         servers:
           - url: http://nginx:80
-EOF
-
-    cat > "${dynamic}/metabase.yml" <<EOF
-http:
-  routers:
-    metabase-lu:
-      entryPoints:
-        - admin
-      rule: "Host(\`$(yaml_quote "${RUNTIME_ENV[METABASE_HOST]}")\`)"
-      service: metabase-lu
-      middlewares:
-        - default-chain
-      tls:
-        options: default
-      priority: 10
-  services:
-    metabase-lu:
-      loadBalancer:
-        passHostHeader: true
-        servers:
-          - url: http://metabase:3000
 EOF
 
     local traefik_yml="${STACK_DIR}/runtime/traefik/traefik.yml"
@@ -249,6 +232,8 @@ ${proxy_secure}    transport:
         readTimeout: 0s
   admin:
     address: ":8443"
+  metabase:
+    address: ":8444"
 providers:
   docker:
     endpoint: "unix:///var/run/docker.sock"

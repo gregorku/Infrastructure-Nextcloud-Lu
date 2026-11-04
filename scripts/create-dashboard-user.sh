@@ -17,6 +17,11 @@ mkdir -p "${DATA_DIR}/traefik/users"
 read -rp "Username [admin]: " username
 username="${username:-admin}"
 [[ "${username}" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || fail "Unsupported username."
-htpasswd -cB "${HTPASSWD_FILE}" "${username}"
+if [[ -f "${HTPASSWD_FILE}" ]]; then
+    htpasswd -B "${HTPASSWD_FILE}" "${username}"
+    ok "Updated ${username} in ${HTPASSWD_FILE}. Other accounts were kept."
+else
+    htpasswd -cB "${HTPASSWD_FILE}" "${username}"
+    ok "Credentials stored in ${HTPASSWD_FILE}. The password was not logged."
+fi
 chmod 600 "${HTPASSWD_FILE}"
-ok "Credentials stored in ${HTPASSWD_FILE}. The password was not logged."

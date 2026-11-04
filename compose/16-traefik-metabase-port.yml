@@ -1,0 +1,13 @@
+###############################################################################
+#
+# Metabase entrypoint on the container address eth0.
+# This is separate from the optional admin bind on 8443.
+# Ports 80 and 443 stay in compose/10-traefik.yml.
+# Source filtering remains a firewall concern and is not defined here.
+#
+###############################################################################
+
+services:
+  traefik:
+    ports:
+      - "192.168.12.233:8444:8444"

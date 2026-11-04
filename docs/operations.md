@@ -8,7 +8,9 @@
 - `DOCKER_PROXY_SUBNET`, `DOCKER_PROXY_GATEWAY`, `DOCKER_INTERNAL_SUBNET`, `DOCKER_INTERNAL_GATEWAY`, soukromé rozsahy s prefixem 16–28, které se nepřekrývají mezi sebou ani s existující Docker sítí;
 - `TRUSTED_PROXIES`, alespoň jeden CIDR ležící uvnitř `DOCKER_PROXY_SUBNET`;
 - `ADMIN_IP_ALLOWLIST`, soukromé CIDR administrátorů;
-- `METABASE_HOST` a `METABASE_SITE_URL` na `https://` tohoto hostitele;
+- `METABASE_IP_ALLOWLIST`, jednotlivé důvěryhodné adresy WireGuard klientů ve tvaru `/32`, které Traefik po DNAT bez SNAT uvidí jako TCP peer na entrypointu `metabase`; celá VPN síť se nezapisuje; hodnota `set_metabase_allowlist` se odmítne a z projektu ji nelze doplnit odhadem;
+- `METABASE_PUBLIC_URL` zůstává `https://10.100.100.1:9444`;
+- hash BasicAuth v `/docker-data/infrastructure-nextcloud-lu/traefik/users/dashboard.htpasswd`, který zapíše `./scripts/create-dashboard-user.sh`; stejný middleware `auth-basic` chrání dashboard i Metabase, opakované spuštění mění jen zadaný účet a soubor v Gitu není;
 - hesla, která `update-env.sh` vygeneruje, pokud v runtime `.env` ještě nejsou.
 
 `TRAEFIK_ACME_EMAIL` smí zůstat `set_acme_email` jen v režimu `TRAEFIK_TLS_MODE=local`. Pro `letsencrypt` musí být skutečný e-mail.
@@ -25,7 +27,7 @@ Potom:
 
 - odmítne deploy, když se `NEXTCLOUD_TAG` liší od `state/installed-version`;
 - založí chybějící sítě `lu-proxy` a `lu-internal`, a existující síť se stejným jménem a jiným rozsahem ponechá beze změny a skončí chybou;
-- vykreslí Traefik, whitelist, router Nextcloudu, router Metabase, `real-ip.conf` a `redis.conf`;
+- vykreslí Traefik, whitelist včetně `metabase-ip-whitelist`, router Nextcloudu, `real-ip.conf` a `redis.conf`; router Metabase zůstává v `configs/traefik/dynamic/metabase.yml`;
 - ověří, že kontejner `dockge` běží a má `DOCKGE_STACKS_DIR=/docker-data/stacks`;
 - spustí `docker compose up -d` bez mazání volume;
 - založí aplikační roli PostgreSQL, pokud chybí.
@@ -40,9 +42,23 @@ Potom:
 
 Upgrade vyžaduje alespoň `UPGRADE_MIN_FREE_MB` volného místa, zapíše zámek a data nemaže. Při chybě `occ upgrade` zámek zůstane. Běžný `deploy.sh` ho odmítne odstranit.
 
-## HAProxy, který se doplní později
+## Metabase přes WireGuard
 
-Než se provoz pustí z internetu, musí být rozhodnuto:
+Metabase nevede přes HAProxy ani přes porty 80 a 443. Cesta je:
+
+```text
+WireGuard klient -> VPS -> WireGuard -> MikroTik, DNAT bez SNAT -> 192.168.12.233:8444 -> Traefik :8444 -> Metabase :3000
+```
+
+- Přístupová adresa je `https://10.100.100.1:9444`.
+- Entrypoint `metabase` nepoužívá PROXY protocol.
+- Původní IP WireGuard klienta zůstává, protože DNAT na MikroTiku nemá SNAT ani masquerade.
+- Návratový provoz k této IP musí MikroTik poslat zpět do WireGuardu. Tento repozitář trasu, VPS ani MikroTik nenastavuje.
+- Do `METABASE_IP_ALLOWLIST` patří až později pozorované klientské `/32`. Celá VPN síť ani odhadnutá adresa se nezapisuje.
+
+## Veřejný vstup Nextcloudu
+
+Nextcloud na portech 80 a 443 jde přes HAProxy na VPS a PROXY protocol. Metabase touto cestou nevede. Mimo tento repozitář zůstává:
 
 - cílová adresa domácího Traefiku dosažitelná z VPS přes stávající WireGuard;
 - porty pro HTTP a HTTPS na této adrese;

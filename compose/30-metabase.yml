@@ -1,7 +1,8 @@
 ###############################################################################
 #
 # Metabase and its own PostgreSQL. Port 3000 is not published.
-# The application is reached only through the admin Traefik router.
+# The application is reached only through Traefik entrypoint metabase.
+# MB_SITE_URL is taken from METABASE_PUBLIC_URL.
 #
 ###############################################################################
 
@@ -53,7 +54,7 @@ services:
       MB_DB_PORT: "5432"
       MB_DB_USER: ${METABASE_DB_USER}
       MB_DB_PASS: ${METABASE_DB_PASSWORD}
-      MB_SITE_URL: ${METABASE_SITE_URL}
+      MB_SITE_URL: ${METABASE_PUBLIC_URL:?METABASE_PUBLIC_URL}
       TZ: ${TZ}
     volumes:
       - ${DATA_DIR}/metabase/data:/metabase-data

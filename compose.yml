@@ -13,6 +13,7 @@ include:
   - compose/00-networks.yml
   - compose/10-traefik.yml
   - compose/15-traefik-admin-port.yml
+  - compose/16-traefik-metabase-port.yml
   - compose/20-crowdsec.yml
   - compose/30-metabase.yml
   - compose/40-postgresql.yml

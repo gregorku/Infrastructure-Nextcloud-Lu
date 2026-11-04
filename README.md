@@ -2,7 +2,7 @@
 
 Samostatný Docker Compose stack pro Nextcloud na `ludek.serveftp.net` v domácím Incus kontejneru s Debianem 13. Docker, Docker Compose a Dockge už v kontejneru jsou. Skripty je neinstalují, nezastavují a neodstraňují.
 
-Stack se má nejdřív spustit a ověřit uvnitř kontejneru. Cesta z internetu přes HAProxy a WireGuard se doplní později, až bude známá cílová adresa a port.
+Veřejný Nextcloud jde na portech 80 a 443 přes HAProxy a PROXY protocol. Metabase je jen přes WireGuard na `https://10.100.100.1:9444`, s cílem `192.168.12.233:8444`.
 
 ## Pořadí skriptů
 
@@ -24,7 +24,7 @@ Skripty se spouštějí jako root v kontejneru, z checkoutu repozitáře. Oček�
 
 | Kontejner | Účel | Publikovaný port |
 | --- | --- | --- |
-| `lu-traefik` | HTTP, HTTPS a administrace | `80` a `443`; `8443` jen při explicitním soukromém bindu |
+| `lu-traefik` | HTTP, HTTPS, administrace a Metabase | `80` a `443`; Metabase `192.168.12.233:8444`; `8443` jen při explicitním soukromém bindu |
 | `lu-crowdsec` | LAPI a rozhodnutí | žádný |
 | `lu-nginx` | HTTP před PHP-FPM | žádný |
 | `lu-nextcloud` | Nextcloud FPM | žádný |

@@ -1,0 +1,47 @@
+###############################################################################
+#
+# Infrastructure-Nextcloud-Lu
+#
+# Metabase on its own entrypoint. Traefik requires a source allowlist
+# and BasicAuth before the application. Metabase keeps its own login.
+# There is no public DNS name. This entrypoint does not use PROXY
+# protocol. Allow individual WireGuard client /32 addresses, not the
+# whole VPN.
+#
+# Client URL: https://10.100.100.1:9444/
+# Container:  192.168.12.233:8444
+# Backend:    http://metabase:3000
+#
+# metabase-ip-whitelist is rendered from METABASE_IP_ALLOWLIST.
+# auth-basic reads the hashed dashboard.htpasswd file.
+#
+###############################################################################
+
+http:
+  routers:
+    metabase:
+      entryPoints:
+        - metabase
+      rule: "PathPrefix(`/`)"
+      service: metabase
+      middlewares:
+        - metabase-chain
+      tls:
+        options: default
+
+  services:
+    metabase:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://metabase:3000"
+
+  middlewares:
+    metabase-chain:
+      chain:
+        middlewares:
+          - metabase-ip-whitelist
+          - headers-default
+          - headers-security
+          - compress
+          - auth-basic

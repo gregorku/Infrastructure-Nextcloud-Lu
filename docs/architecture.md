@@ -1,22 +1,38 @@
 # Architektura
 
-## Současná a pozdější cesta
+## Dva vstupy
 
 V domácím kontejneru stack poslouchá na Traefiku. Lokální zkouška používá `PROXY_PROTOCOL_MODE=local` a `TRAEFIK_TLS_MODE=local`. Traefik v tomto režimu nečeká PROXY hlavičku a používá svůj výchozí certifikát.
 
-Pozdější veřejná cesta:
+Veřejný a funkční vstup Nextcloudu je na portech 80 a 443. PROXY protocol patří jen sem:
 
 ```text
 Internet
   -> DNS ludek.serveftp.net na veřejnou adresu VPS
   -> HAProxy na VPS, send-proxy-v2
   -> existující WireGuard
-  -> Traefik v tomto kontejneru
+  -> Traefik entrypointy web :80 a websecure :443
   -> Nginx
   -> Nextcloud FPM
 ```
 
-Cílová IP a port na domácí straně zatím nejsou dané. Tento repozitář proto nezapisuje backend HAProxy, peer WireGuardu, firewall ani DNAT. `10.10.10.10` je Traefik na VPS a do tohoto stacku nepatří.
+Tento repozitář nezapisuje backend HAProxy, peer WireGuardu, firewall ani DNAT této cesty. `10.10.10.10` je Traefik na VPS a do tohoto stacku nepatří.
+
+Metabase je dostupná jen přes WireGuard. Nejde přes veřejný internet, HAProxy ani porty 80 a 443:
+
+```text
+WireGuard klient
+  -> VPS
+  -> WireGuard
+  -> MikroTik, DNAT bez SNAT a bez masquerade
+  -> Incus nextcloudLu, 192.168.12.233:8444
+  -> Traefik entrypoint metabase :8444
+  -> Metabase :3000
+```
+
+Přístupová adresa je `https://10.100.100.1:9444`. Entrypoint `metabase` PROXY protocol nepoužívá, takže Traefik vidí TCP peer po DNAT. MikroTik zdrojovou adresu nemění, a proto je tím peerem původní adresa WireGuard klienta. Návratová trasa k této adrese je odpovědnost MikroTiku. Tento repozitář ji nenastavuje a konfiguraci VPS ani MikroTiku nemění.
+
+`METABASE_IP_ALLOWLIST` uvádí jednotlivé důvěryhodné klientské adresy jako `/32`. Celá VPN síť se nepovoluje automaticky. Skutečné adresy v projektu nejsou. Placeholder `set_metabase_allowlist` deploy odmítne.
 
 ## Entrypointy
 
@@ -24,21 +40,24 @@ Cílová IP a port na domácí straně zatím nejsou dané. Tento repozitář pr
 
 - `web` na `:80` přesměruje na `websecure`;
 - `websecure` na `:443` má `readTimeout: 0s` kvůli velkým uploadům;
-- `admin` na `:8443` slouží dashboardu a Metabase.
+- `admin` na `:8443` slouží dashboardu Traefiku;
+- `metabase` na `:8444` slouží jen Metabase.
 
 Soubor v Gitu `compose/15-traefik-admin-port.yml` port nezveřejňuje. Po synchronizaci ho `deploy.sh` přepíše jen v adresáři stacku. `TRAEFIK_ADMIN_PUBLISH` smí mít tvar `soukromá-adresa:8443:8443`. Prázdná hodnota port na hostiteli nezveřejní.
 
 ## Routery
 
-Veřejný router Nextcloudu platí pro `Host(\`ludek.serveftp.net\`)` na `websecure`. Middleware `nextcloud-chain` obsahuje hlavičky vhodné pro Nextcloud, CrowdSec, limit požadavků a kompresi. BasicAuth ani Authentik na tomto routeru není, aby zůstaly funkční WebDAV, klienti a přihlášení Nextcloudu.
+Veřejný router Nextcloudu platí pro `Host(\`ludek.serveftp.net\`)` na `websecure`. Middleware `nextcloud-chain` obsahuje hlavičky vhodné pro Nextcloud, CrowdSec, limit požadavků a kompresi. BasicAuth na tomto routeru není, aby zůstaly funkční WebDAV, klienti a přihlášení Nextcloudu.
 
-Dashboard Traefiku a Metabase mají entrypoint `admin` a middleware `default-chain`: IP whitelist, bezpečnostní hlavičky, komprese a BasicAuth. Metabase má navíc vlastní přihlášení. Metabase není na routeru Nextcloudu.
+Dashboard Traefiku má entrypoint `admin` a middleware `default-chain`: IP whitelist, bezpečnostní hlavičky, komprese a BasicAuth.
+
+Metabase má entrypoint `metabase` na portu `8444`, hostitelský bind `192.168.12.233:8444`, pravidlo `PathPrefix(/)` a backend `http://metabase:3000`. Přístupová adresa je `https://10.100.100.1:9444`. Před aplikací Traefik vyžaduje `METABASE_IP_ALLOWLIST` a BasicAuth ze souboru `dashboard.htpasswd`. Metabase si potom ponechává vlastní přihlášení. Nemá veřejné DNS jméno a není na routeru Nextcloudu. Allowlist jsou jednotlivé `/32` WireGuard klientů, ne celá VPN.
 
 `TRUSTED_PROXIES` v Nextcloudu musí být CIDR uvnitř `DOCKER_PROXY_SUBNET`. To je síť, ze které Nginx vidí Traefik. Veřejný internet ani rozsah WireGuardu sem nepatří.
 
 ## PROXY protocol a forwarded hlavičky
 
-`PROXY_PROTOCOL_MODE=local` blok `proxyProtocol` nevykreslí. Lokální klient může otevřít Traefik bez PROXY hlavičky. V access logu je potom TCP peer, u lokální zkoušky adresa toho klienta.
+`PROXY_PROTOCOL_MODE=local` blok `proxyProtocol` nevykreslí. Lokální klient může otevřít Traefik bez PROXY hlavičky. V access logu je potom TCP peer, u lokální zkoušky adresa toho klienta. Režim `haproxy` zapisuje `proxyProtocol` jen na entrypointy `web` a `websecure`. Entrypointy `admin` a `metabase` ho nemají.
 
 `PROXY_PROTOCOL_MODE=haproxy` vykreslí `proxyProtocol.trustedIPs` jen jako seznam `/32`. Vyžaduje `TRAEFIK_TLS_MODE=letsencrypt`. `proxyProtocol.insecure` se nezapíná.
 
