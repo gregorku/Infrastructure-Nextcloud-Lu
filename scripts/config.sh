@@ -31,7 +31,7 @@ readonly DEPLOY_ITEMS=(
 readonly NETWORK_PROXY="lu-proxy"
 readonly NETWORK_INTERNAL="lu-internal"
 
-readonly NEXTCLOUD_DOMAIN="ludek.serveftp.org"
+readonly NEXTCLOUD_DOMAIN="ludek.serveftp.net"
 
 readonly DOCKGE_CONTAINER="dockge"
 readonly DOCKGE_PORT="5001"

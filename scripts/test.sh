@@ -25,6 +25,19 @@ static_checks() {
     if grep -R -n "bridge-moje\|traefik-moje\|gregor.serveftp.org" "${REPO_ROOT}/compose" "${REPO_ROOT}/configs" "${REPO_ROOT}/.env.example"; then
         fail_static "a foreign project name is present"
     fi
+    if grep -R -n --exclude test.sh --exclude-dir .git "ludek.serveftp.org" "${REPO_ROOT}"; then
+        fail_static "old domain ludek.serveftp.org is present"
+    fi
+    grep -q 'readonly NEXTCLOUD_DOMAIN="ludek.serveftp.net"' "${REPO_ROOT}/scripts/config.sh" \
+        || fail_static "NEXTCLOUD_DOMAIN is not ludek.serveftp.net"
+    grep -q 'server_name ludek.serveftp.net;' "${REPO_ROOT}/configs/nginx/nginx.conf" \
+        || fail_static "nginx server_name is not ludek.serveftp.net"
+    for key in NEXTCLOUD_DOMAIN NEXTCLOUD_TRUSTED_DOMAINS OVERWRITEHOST; do
+        grep -q "^${key}=ludek.serveftp.net$" "${REPO_ROOT}/.env.example" \
+            || fail_static "${key} in .env.example is not ludek.serveftp.net"
+    done
+    grep -q '^OVERWRITECLIURL=https://ludek.serveftp.net$' "${REPO_ROOT}/.env.example" \
+        || fail_static "OVERWRITECLIURL in .env.example is not https://ludek.serveftp.net"
     if grep -nE '^[[:space:]]*- "(5432|6379|9000|3000):' "${REPO_ROOT}/compose/"*.yml; then
         fail_static "an internal service publishes a host port"
     fi

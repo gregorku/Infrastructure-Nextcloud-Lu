@@ -47,7 +47,7 @@ Než se provoz pustí z internetu, musí být rozhodnuto:
 - cílová adresa domácího Traefiku dosažitelná z VPS přes stávající WireGuard;
 - porty pro HTTP a HTTPS na této adrese;
 - TCP adresa, kterou Traefik uvidí jako zdroj HAProxy, zapsaná do `PROXY_PROTOCOL_TRUSTED_IPS`;
-- úprava HAProxy tak, aby `ludek.serveftp.org` nepadal do výchozího backendu Gregora Nextcloudu;
+- úprava HAProxy tak, aby `ludek.serveftp.net` nepadal do výchozího backendu Gregora Nextcloudu;
 - průchod portu 80 až na entrypoint `web`, jinak HTTP-01 certifikát nevznikne;
 - timeout HAProxy pro uploady 16G. Výchozí timeout 50 s na VPS umí velký upload přerušit i při `readTimeout: 0s` na Traefiku.
 

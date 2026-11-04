@@ -8,7 +8,7 @@ Pozdější veřejná cesta:
 
 ```text
 Internet
-  -> DNS ludek.serveftp.org na veřejnou adresu VPS
+  -> DNS ludek.serveftp.net na veřejnou adresu VPS
   -> HAProxy na VPS, send-proxy-v2
   -> existující WireGuard
   -> Traefik v tomto kontejneru
@@ -30,7 +30,7 @@ Soubor v Gitu `compose/15-traefik-admin-port.yml` port nezveřejňuje. Po synchr
 
 ## Routery
 
-Veřejný router Nextcloudu platí pro `Host(\`ludek.serveftp.org\`)` na `websecure`. Middleware `nextcloud-chain` obsahuje hlavičky vhodné pro Nextcloud, CrowdSec, limit požadavků a kompresi. BasicAuth ani Authentik na tomto routeru není, aby zůstaly funkční WebDAV, klienti a přihlášení Nextcloudu.
+Veřejný router Nextcloudu platí pro `Host(\`ludek.serveftp.net\`)` na `websecure`. Middleware `nextcloud-chain` obsahuje hlavičky vhodné pro Nextcloud, CrowdSec, limit požadavků a kompresi. BasicAuth ani Authentik na tomto routeru není, aby zůstaly funkční WebDAV, klienti a přihlášení Nextcloudu.
 
 Dashboard Traefiku a Metabase mají entrypoint `admin` a middleware `default-chain`: IP whitelist, bezpečnostní hlavičky, komprese a BasicAuth. Metabase má navíc vlastní přihlášení. Metabase není na routeru Nextcloudu.
 

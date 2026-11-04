@@ -1,6 +1,6 @@
 # Infrastructure-Nextcloud-Lu
 
-Samostatný Docker Compose stack pro Nextcloud na `ludek.serveftp.org` v domácím Incus kontejneru s Debianem 13. Docker, Docker Compose a Dockge už v kontejneru jsou. Skripty je neinstalují, nezastavují a neodstraňují.
+Samostatný Docker Compose stack pro Nextcloud na `ludek.serveftp.net` v domácím Incus kontejneru s Debianem 13. Docker, Docker Compose a Dockge už v kontejneru jsou. Skripty je neinstalují, nezastavují a neodstraňují.
 
 Stack se má nejdřív spustit a ověřit uvnitř kontejneru. Cesta z internetu přes HAProxy a WireGuard se doplní později, až bude známá cílová adresa a port.
 
