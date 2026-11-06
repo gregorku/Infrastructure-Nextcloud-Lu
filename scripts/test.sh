@@ -547,6 +547,120 @@ EOF
     rm -rf "${dir}"
 }
 
+check_rendered_traefik() {
+    local metabase_file="$1" dashboard_file="$2" deploy_file="$3"
+    local reason
+    if ! reason="$(awk '
+        {
+            text = text $0 "\n"
+            rest = $0
+            while ((i = index(rest, "entryPoints:")) > 0) {
+                count++
+                rest = substr(rest, i + length("entryPoints:"))
+            }
+        }
+        END {
+            if (count != 1) {
+                print "Metabase file does not have exactly one router"
+                exit 1
+            }
+            after = substr(text, index(text, "entryPoints:") + length("entryPoints:"))
+            rule_at = index(after, "rule:")
+            if (rule_at == 0) router = after
+            else router = substr(after, 1, rule_at - 1)
+            if (index(router, "- metabase") == 0 || index(router, "- admin") > 0) {
+                print "Metabase router is not only on entrypoint metabase"
+                exit 1
+            }
+            if (index(text, "rule: \"PathPrefix(`/`)\"") == 0 || index(text, "Host(") > 0) {
+                print "Metabase rule is not PathPrefix(/)"
+                exit 1
+            }
+            if (index(text, "url: \"http://metabase:3000\"") == 0) {
+                print "Metabase backend changed"
+                exit 1
+            }
+            chain_at = index(text, "metabase-chain:")
+            if (chain_at == 0) {
+                print "Metabase chain lost IP allowlist or BasicAuth"
+                exit 1
+            }
+            chain = substr(text, chain_at + length("metabase-chain:"))
+            if (index(chain, "metabase-ip-whitelist") == 0 || index(chain, "auth-basic") == 0) {
+                print "Metabase chain lost IP allowlist or BasicAuth"
+                exit 1
+            }
+        }
+    ' "${metabase_file}")"; then
+        printf '%s\n' "${reason}" >&2
+        return 1
+    fi
+    if ! reason="$(awk '
+        { text = text $0 "\n" }
+        END {
+            if (index(text, "entryPoints:\n        - admin") == 0) {
+                print "dashboard router left entrypoint admin"
+                exit 1
+            }
+            if (index(text, "metabase") > 0) {
+                print "dashboard file contains a Metabase router"
+                exit 1
+            }
+        }
+    ' "${dashboard_file}")"; then
+        printf '%s\n' "${reason}" >&2
+        return 1
+    fi
+    if ! reason="$(awk '
+        BEGIN { found = 0; body = "" }
+        index($0, "cat > \"${traefik_yml}\" <<EOF") { found = 1; next }
+        found {
+            if ($0 == "EOF") exit
+            line = $0
+            gsub(/\$\{proxy_web\}/, "", line)
+            gsub(/\$\{proxy_secure\}/, "", line)
+            gsub(/\$\{acme\}/, "", line)
+            gsub(/\$\{RUNTIME_ENV\[CROWDSEC_BOUNCER_PLUGIN\]\}/, "v1.7.0", line)
+            body = body line "\n"
+        }
+        END {
+            if (!found) {
+                print "Traefik render template was not found"
+                exit 1
+            }
+            required[1] = "address: \":80\""
+            required[2] = "address: \":443\""
+            required[3] = "address: \":8443\""
+            required[4] = "address: \":8444\""
+            required[5] = "readTimeout: 0s"
+            for (i = 1; i <= 5; i++) {
+                if (index(body, required[i]) == 0) {
+                    print "missing " required[i]
+                    exit 1
+                }
+            }
+            if (index(body, "proxyProtocol:") > 0) {
+                print "local render enables proxyProtocol"
+                exit 1
+            }
+            if (index(body, "forwardedHeaders:") > 0 || index(body, "insecure: true") > 0) {
+                print "local render trusts forwarded headers or enables insecure mode"
+                exit 1
+            }
+            web_at = index(body, "websecure:")
+            if (web_at == 0) web = body
+            else web = substr(body, 1, web_at - 1)
+            if (index(web, "address: \":80\"") == 0 || index(web, "address: \":443\"") > 0) {
+                print "web entrypoint changed"
+                exit 1
+            }
+        }
+    ' "${deploy_file}")"; then
+        printf '%s\n' "${reason}" >&2
+        return 1
+    fi
+}
+
 static_checks() {
     local script
     while IFS= read -r script; do
@@ -655,48 +769,11 @@ static_checks() {
         || fail_static "BasicAuth does not use dashboard.htpasswd"
     grep -q '^dashboard\.htpasswd$' "${REPO_ROOT}/.gitignore" \
         || fail_static "dashboard.htpasswd is not ignored"
-    python3 - "${REPO_ROOT}/configs/traefik/dynamic/metabase.yml" "${REPO_ROOT}/configs/traefik/dynamic/dashboard.yml" "${REPO_ROOT}/scripts/lib/deploy.sh" <<'PY' || fail_static "rendered Traefik or Metabase config is invalid"
-import pathlib, sys
-metabase = pathlib.Path(sys.argv[1]).read_text()
-dashboard = pathlib.Path(sys.argv[2]).read_text()
-deploy = pathlib.Path(sys.argv[3]).read_text()
-if metabase.count("entryPoints:") != 1:
-    sys.exit("Metabase file does not have exactly one router")
-router = metabase.split("entryPoints:", 1)[1].split("rule:", 1)[0]
-if "- metabase" not in router or "- admin" in router:
-    sys.exit("Metabase router is not only on entrypoint metabase")
-if 'rule: "PathPrefix(`/`)"' not in metabase or "Host(" in metabase:
-    sys.exit("Metabase rule is not PathPrefix(/)")
-if 'url: "http://metabase:3000"' not in metabase:
-    sys.exit("Metabase backend changed")
-chain = metabase.split("metabase-chain:", 1)[1]
-if "metabase-ip-whitelist" not in chain or "auth-basic" not in chain:
-    sys.exit("Metabase chain lost IP allowlist or BasicAuth")
-if "entryPoints:\n        - admin" not in dashboard:
-    sys.exit("dashboard router left entrypoint admin")
-if "metabase" in dashboard:
-    sys.exit("dashboard file contains a Metabase router")
-marker = 'cat > "${traefik_yml}" <<EOF\n'
-body = deploy.split(marker, 1)[1].split("\nEOF", 1)[0]
-rendered = (body.replace("${proxy_web}", "").replace("${proxy_secure}", "").replace("${acme}", "").replace("${RUNTIME_ENV[CROWDSEC_BOUNCER_PLUGIN]}", "v1.7.0"))
-required = [
-    'address: ":80"',
-    'address: ":443"',
-    'address: ":8443"',
-    'address: ":8444"',
-    "readTimeout: 0s",
-]
-for item in required:
-    if item not in rendered:
-        sys.exit(f"missing {item}")
-if "proxyProtocol:" in rendered:
-    sys.exit("local render enables proxyProtocol")
-if "forwardedHeaders:" in rendered or "insecure: true" in rendered:
-    sys.exit("local render trusts forwarded headers or enables insecure mode")
-web = rendered.split("websecure:", 1)[0]
-if 'address: ":80"' not in web or 'address: ":443"' in web:
-    sys.exit("web entrypoint changed")
-PY
+    check_rendered_traefik \
+        "${REPO_ROOT}/configs/traefik/dynamic/metabase.yml" \
+        "${REPO_ROOT}/configs/traefik/dynamic/dashboard.yml" \
+        "${REPO_ROOT}/scripts/lib/deploy.sh" \
+        || fail_static "rendered Traefik or Metabase config is invalid"
     if grep -nE '^[[:space:]]*- "(5432|6379|9000|3000):' "${REPO_ROOT}/compose/"*.yml; then
         fail_static "an internal service publishes a host port"
     fi
