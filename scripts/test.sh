@@ -503,6 +503,50 @@ check_crowdsec_post_deploy() {
     CROWDSEC_TEST_ROOT=""
 }
 
+check_env_sync_preserves_user_values() {
+    local dir example current
+    dir="$(mktemp -d)"
+    example="${dir}/example"
+    current="${dir}/runtime.env"
+    cat > "${example}" <<'EOF'
+# comment stays
+PG_PASS=set_postgres_password
+NEXTCLOUD_DOMAIN=ludek.serveftp.net
+NGINX_TRUSTED_PROXIES=172.18.0.2/32
+TRUSTED_PROXIES=
+EOF
+    cat > "${current}" <<'EOF'
+PG_PASS=kept-user-secret-value
+NEXTCLOUD_DOMAIN=old.example
+NGINX_TRUSTED_PROXIES=172.18.0.5/32
+TRUSTED_PROXIES=172.18.0.9/32
+EOF
+    env_sync_file "${example}" "${current}"
+    grep -q '^PG_PASS=kept-user-secret-value$' "${current}" \
+        || fail_static "sync replaced an existing secret"
+    grep -q '^NGINX_TRUSTED_PROXIES=172.18.0.5/32$' "${current}" \
+        || fail_static "sync replaced an existing NGINX_TRUSTED_PROXIES value"
+    grep -q '^TRUSTED_PROXIES=172.18.0.9/32$' "${current}" \
+        || fail_static "sync replaced an existing TRUSTED_PROXIES value"
+    grep -q '^NEXTCLOUD_DOMAIN=ludek.serveftp.net$' "${current}" \
+        || fail_static "sync did not keep the framework domain"
+    rm -rf "${dir}"
+
+    dir="$(mktemp -d)"
+    example="${dir}/example"
+    current="${dir}/runtime.env"
+    printf '%s\n' 'PG_PASS=set_postgres_password' 'NGINX_TRUSTED_PROXIES=172.18.0.2/32' 'TRUSTED_PROXIES=' > "${example}"
+    printf '%s\n' 'PG_PASS=kept-user-secret-value' 'TRUSTED_PROXIES=set_trusted_proxies' > "${current}"
+    env_sync_file "${example}" "${current}"
+    grep -q '^PG_PASS=kept-user-secret-value$' "${current}" \
+        || fail_static "sync replaced a secret while adding NGINX_TRUSTED_PROXIES"
+    grep -q '^NGINX_TRUSTED_PROXIES=172.18.0.2/32$' "${current}" \
+        || fail_static "sync did not add the default NGINX_TRUSTED_PROXIES"
+    grep -q '^TRUSTED_PROXIES=$' "${current}" \
+        || fail_static "sync kept the old TRUSTED_PROXIES placeholder"
+    rm -rf "${dir}"
+}
+
 static_checks() {
     local script
     while IFS= read -r script; do
@@ -541,6 +585,34 @@ static_checks() {
         || fail_static "METABASE_PUBLIC_URL is not https://10.100.100.1:9444"
     grep -q 'MB_SITE_URL: ${METABASE_PUBLIC_URL:?METABASE_PUBLIC_URL}' "${REPO_ROOT}/compose/30-metabase.yml" \
         || fail_static "Metabase Compose does not use METABASE_PUBLIC_URL"
+    awk '
+        $0 ~ /lu-proxy:/ { proxy = 1; internal = 0 }
+        $0 ~ /lu-internal:/ { internal = 1; proxy = 0 }
+        proxy && /ipv4_address: 172\.18\.0\.2/ { found = 1 }
+        internal && /ipv4_address/ { bad = 1 }
+        END { exit !(found && !bad) }
+    ' "${REPO_ROOT}/compose/10-traefik.yml" \
+        || fail_static "Traefik does not have fixed address 172.18.0.2 on lu-proxy"
+    grep -F -q 'for cidr in ${RUNTIME_ENV[NGINX_TRUSTED_PROXIES]}' "${REPO_ROOT}/scripts/lib/deploy.sh" \
+        || fail_static "Nginx real IP is not rendered from NGINX_TRUSTED_PROXIES"
+    if grep -F -q 'for cidr in ${RUNTIME_ENV[TRUSTED_PROXIES]}' "${REPO_ROOT}/scripts/lib/deploy.sh"; then
+        fail_static "Nginx real IP still uses Nextcloud TRUSTED_PROXIES"
+    fi
+    grep -q 'real_ip_header X-Forwarded-For;' "${REPO_ROOT}/scripts/lib/deploy.sh" \
+        || fail_static "real_ip_header changed"
+    grep -q 'real_ip_recursive on;' "${REPO_ROOT}/scripts/lib/deploy.sh" \
+        || fail_static "real_ip_recursive changed"
+    grep -q 'NGINX_TRUSTED_PROXIES' "${REPO_ROOT}/configs/nginx/nginx.conf" \
+        || fail_static "nginx comment does not name NGINX_TRUSTED_PROXIES"
+    grep -q '^NGINX_TRUSTED_PROXIES=172.18.0.2/32$' "${REPO_ROOT}/.env.example" \
+        || fail_static "NGINX_TRUSTED_PROXIES example is not 172.18.0.2/32"
+    grep -q '^TRUSTED_PROXIES=$' "${REPO_ROOT}/.env.example" \
+        || fail_static "TRUSTED_PROXIES example is not empty"
+    grep -q 'TRUSTED_PROXIES: ${TRUSTED_PROXIES}' "${REPO_ROOT}/compose/60-nextcloud-fpm.yml" \
+        || fail_static "Nextcloud no longer receives TRUSTED_PROXIES"
+    if grep -q 'NGINX_TRUSTED_PROXIES' "${REPO_ROOT}/compose/60-nextcloud-fpm.yml"; then
+        fail_static "Nextcloud receives the Nginx proxy list"
+    fi
     grep -q -- '- "80:80"' "${REPO_ROOT}/compose/10-traefik.yml" \
         || fail_static "Traefik port 80 is missing"
     grep -q -- '- "443:443"' "${REPO_ROOT}/compose/10-traefik.yml" \
@@ -650,6 +722,65 @@ PY
     check_metabase_allowlist reject "10.66.0.256/32" "invalid IPv4"
     grep -q 'env_load_runtime' "${REPO_ROOT}/scripts/deploy.sh" \
         || fail_static "deploy does not validate the environment"
+    env_nginx_trusted_proxies_check "172.18.0.2/32" "172.18.0.0/24" "172.18.0.1" \
+        || fail_static "NGINX_TRUSTED_PROXIES rejected the Traefik /32"
+    if env_nginx_trusted_proxies_check "172.18.0.2/24" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "NGINX_TRUSTED_PROXIES accepted 172.18.0.2/24"
+    fi
+    if env_nginx_trusted_proxies_check "172.18.0.0/24" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "NGINX_TRUSTED_PROXIES accepted 172.18.0.0/24"
+    fi
+    if env_nginx_trusted_proxies_check "172.18.0.2/31" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "NGINX_TRUSTED_PROXIES accepted 172.18.0.2/31"
+    fi
+    if env_nginx_trusted_proxies_check "172.18.0.3/32" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "NGINX_TRUSTED_PROXIES accepted 172.18.0.3/32"
+    fi
+    if env_nginx_trusted_proxies_check "172.18.0.2/32 172.18.0.3/32" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "NGINX_TRUSTED_PROXIES accepted more than the Traefik address"
+    fi
+    if env_nginx_trusted_proxies_check "0.0.0.0/0" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "NGINX_TRUSTED_PROXIES accepted 0.0.0.0/0"
+    fi
+    if env_nginx_trusted_proxies_check "10.0.0.2/32" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "NGINX_TRUSTED_PROXIES accepted an address outside DOCKER_PROXY_SUBNET"
+    fi
+    if env_nginx_trusted_proxies_check "172.18.0.2/33" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "NGINX_TRUSTED_PROXIES accepted an invalid CIDR"
+    fi
+    if env_nginx_trusted_proxies_check "" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "NGINX_TRUSTED_PROXIES accepted an empty list"
+    fi
+    if env_nginx_trusted_proxies_check "172.18.0.2/32,172.18.0.3/32" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "NGINX_TRUSTED_PROXIES accepted a comma-separated list"
+    fi
+    [[ "$(env_traefik_proxy_address)" == "172.18.0.2" ]] \
+        || fail_static "Traefik proxy address constant changed"
+    env_traefik_proxy_address_check "172.18.0.2" "172.18.0.0/24" "172.18.0.1" \
+        || fail_static "Traefik address 172.18.0.2 was rejected"
+    env_traefik_proxy_address_check "172.18.0.2" "172.18.0.0/16" "172.18.0.1" \
+        || fail_static "Traefik address was rejected inside a /16"
+    if env_traefik_proxy_address_check "172.18.0.0" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "Traefik address may be the network address"
+    fi
+    if env_traefik_proxy_address_check "172.18.0.255" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "Traefik address may be the broadcast address"
+    fi
+    if env_traefik_proxy_address_check "172.18.255.255" "172.18.0.0/16" "172.18.0.1" >/dev/null; then
+        fail_static "Traefik address may be the /16 broadcast address"
+    fi
+    if env_traefik_proxy_address_check "172.18.0.1" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "Traefik address may be the gateway"
+    fi
+    if env_traefik_proxy_address_check "10.20.0.2" "172.18.0.0/24" "172.18.0.1" >/dev/null; then
+        fail_static "Traefik address outside DOCKER_PROXY_SUBNET was accepted"
+    fi
+    env_nextcloud_trusted_proxies_check "" "172.18.0.0/24" \
+        || fail_static "empty TRUSTED_PROXIES was rejected"
+    if env_nextcloud_trusted_proxies_check "0.0.0.0/0" "172.18.0.0/24" >/dev/null; then
+        fail_static "TRUSTED_PROXIES accepted 0.0.0.0/0"
+    fi
+    check_env_sync_preserves_user_values
     env_cidr_ok "10.20.0.0/24" || fail_static "CIDR parser rejected 10.20.0.0/24"
     if env_cidr_ok "10.20.0.0/33"; then
         fail_static "CIDR parser accepted prefix 33"

@@ -18,7 +18,8 @@ services:
     command:
       - --configFile=/etc/traefik/traefik.yml
     networks:
-      lu-proxy: {}
+      lu-proxy:
+        ipv4_address: 172.18.0.2
       lu-internal: {}
     ports:
       - "80:80"

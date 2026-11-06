@@ -53,7 +53,7 @@ Dashboard Traefiku má entrypoint `admin` a middleware `default-chain`: IP white
 
 Metabase má entrypoint `metabase` na portu `8444`, hostitelský bind `192.168.12.233:8444`, pravidlo `PathPrefix(/)` a backend `http://metabase:3000`. Přístupová adresa je `https://10.100.100.1:9444`. Před aplikací Traefik vyžaduje `METABASE_IP_ALLOWLIST` a BasicAuth ze souboru `dashboard.htpasswd`. Metabase si potom ponechává vlastní přihlášení. Nemá veřejné DNS jméno a není na routeru Nextcloudu. Allowlist jsou jednotlivé `/32` WireGuard klientů, ne celá VPN.
 
-`TRUSTED_PROXIES` v Nextcloudu musí být CIDR uvnitř `DOCKER_PROXY_SUBNET`. To je síť, ze které Nginx vidí Traefik. Veřejný internet ani rozsah WireGuardu sem nepatří.
+`NGINX_TRUSTED_PROXIES` je CIDR uvnitř `DOCKER_PROXY_SUBNET`. Výchozí je pevná adresa Traefiku `172.18.0.2/32`. `TRUSTED_PROXIES` pro Nextcloud zůstává prázdné, takže Nextcloud nedůvěřuje HTTP proxy. Veřejný internet ani rozsah WireGuardu sem nepatří.
 
 ## PROXY protocol a forwarded hlavičky
 

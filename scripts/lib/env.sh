@@ -32,6 +32,7 @@ ENV_POLICY[REDIS_CONFIG_FILE]="framework"
 ENV_POLICY[REDIS_PASSWORD]="generated"
 ENV_POLICY[NEXTCLOUD_ADMIN_USER]="user"
 ENV_POLICY[NEXTCLOUD_ADMIN_PASSWORD]="generated"
+ENV_POLICY[NGINX_TRUSTED_PROXIES]="user"
 ENV_POLICY[TRUSTED_PROXIES]="user"
 ENV_POLICY[OVERWRITEPROTOCOL]="framework"
 ENV_POLICY[OVERWRITEHOST]="framework"
@@ -228,6 +229,113 @@ env_path_nested() {
     [[ "${a}" == "${b}" || "${a}" == "${b}"/* || "${b}" == "${a}"/* ]]
 }
 
+# Fixed address of lu-traefik on lu-proxy. compose/10-traefik.yml uses the same value.
+env_traefik_proxy_address() {
+    printf '%s\n' "172.18.0.2"
+}
+
+env_subnet_bounds() {
+    local cidr="$1" prefix base_int mask host_bits
+    prefix="${cidr#*/}"
+    base_int="$(env_ipv4_to_int "${cidr%/*}")"
+    if [[ "${prefix}" -eq 0 ]]; then
+        printf '%s %s\n' 0 4294967295
+        return 0
+    fi
+    host_bits=$((32 - prefix))
+    mask=$(( (0xFFFFFFFF << host_bits) & 0xFFFFFFFF ))
+    printf '%s %s\n' $(( base_int & mask )) $(( (base_int & mask) | ((1 << host_bits) - 1) ))
+}
+
+env_traefik_proxy_address_check() {
+    local ip="$1" subnet="$2" gateway="$3"
+    local ip_int gateway_int network_int broadcast_int
+    local IFS=$' \t\n'
+    if ! env_ipv4_octets_ok "${ip}"; then
+        printf '%s\n' "Traefik proxy address is not an IPv4 address."
+        return 1
+    fi
+    if ! env_cidr_ok "${subnet}" || ! env_cidr_contains_ip "${subnet}" "${ip}"; then
+        printf '%s\n' "Traefik proxy address ${ip} is outside DOCKER_PROXY_SUBNET."
+        return 1
+    fi
+    read -r network_int broadcast_int <<< "$(env_subnet_bounds "${subnet}")"
+    ip_int="$(env_ipv4_to_int "${ip}")"
+    if [[ "${ip_int}" -eq "${network_int}" ]]; then
+        printf '%s\n' "Traefik proxy address must not be the network address."
+        return 1
+    fi
+    if [[ "${ip_int}" -eq "${broadcast_int}" ]]; then
+        printf '%s\n' "Traefik proxy address must not be the broadcast address."
+        return 1
+    fi
+    if ! env_ipv4_octets_ok "${gateway}"; then
+        printf '%s\n' "DOCKER_PROXY_GATEWAY is not an IPv4 address."
+        return 1
+    fi
+    gateway_int="$(env_ipv4_to_int "${gateway}")"
+    if [[ "${ip_int}" -eq "${gateway_int}" ]]; then
+        printf '%s\n' "Traefik proxy address must not be the gateway."
+        return 1
+    fi
+}
+
+env_nginx_trusted_proxies_check() {
+    local list="$1" subnet="$2" gateway="${3-}"
+    local ip expected item count=0
+    local IFS=$' \t\n'
+    if [[ -z "${list//[[:space:]]/}" ]]; then
+        printf '%s\n' "NGINX_TRUSTED_PROXIES is empty."
+        return 1
+    fi
+    if [[ "${list}" == *","* ]]; then
+        printf '%s\n' "NGINX_TRUSTED_PROXIES is space-separated."
+        return 1
+    fi
+    if env_is_placeholder "${list}"; then
+        printf '%s\n' "NGINX_TRUSTED_PROXIES is still a placeholder."
+        return 1
+    fi
+    ip="$(env_traefik_proxy_address)"
+    expected="${ip}/32"
+    for item in ${list}; do
+        count=$((count + 1))
+        if [[ "${count}" -gt 1 || "${item}" != "${expected}" ]]; then
+            printf '%s\n' "NGINX_TRUSTED_PROXIES must be ${expected}."
+            return 1
+        fi
+    done
+    if [[ "${count}" -ne 1 ]]; then
+        printf '%s\n' "NGINX_TRUSTED_PROXIES must be ${expected}."
+        return 1
+    fi
+    env_traefik_proxy_address_check "${ip}" "${subnet}" "${gateway}"
+}
+
+env_nextcloud_trusted_proxies_check() {
+    local list="$1" subnet="$2" cidr
+    local IFS=$' \t\n'
+    if [[ "${list}" == *","* ]]; then
+        printf '%s\n' "TRUSTED_PROXIES is space-separated."
+        return 1
+    fi
+    [[ -z "${list//[[:space:]]/}" ]] && return 0
+    for cidr in ${list}; do
+        if ! env_cidr_ok "${cidr}"; then
+            printf '%s\n' "Invalid TRUSTED_PROXIES CIDR: ${cidr}"
+            return 1
+        fi
+        if [[ "${cidr}" == "0.0.0.0/0" ]]; then
+            printf '%s\n' "TRUSTED_PROXIES must not be 0.0.0.0/0."
+            return 1
+        fi
+        if ! env_cidr_contains_ip "${subnet}" "${cidr%/*}"; then
+            printf '%s\n' "TRUSTED_PROXIES ${cidr} is outside DOCKER_PROXY_SUBNET. Nextcloud must trust only the Traefik Docker network."
+            return 1
+        fi
+    done
+}
+
 env_validate_subnet_pair() {
     local name="$1" subnet="$2" gateway="$3" prefix
     env_cidr_ok "${subnet}" || fail "${name} subnet is not a CIDR."
@@ -271,14 +379,16 @@ env_validate_runtime() {
         fail "Docker proxy and internal subnets overlap."
     fi
 
-    [[ "${env_ref[TRUSTED_PROXIES]}" != *","* ]] || fail "TRUSTED_PROXIES is space-separated."
-    local cidr
-    for cidr in ${env_ref[TRUSTED_PROXIES]}; do
-        env_cidr_ok "${cidr}" || fail "Invalid TRUSTED_PROXIES CIDR: ${cidr}"
-        [[ "${cidr}" != "0.0.0.0/0" ]] || fail "TRUSTED_PROXIES must not be 0.0.0.0/0."
-        env_cidr_contains_ip "${env_ref[DOCKER_PROXY_SUBNET]}" "${cidr%/*}" \
-            || fail "TRUSTED_PROXIES ${cidr} is outside DOCKER_PROXY_SUBNET. Nextcloud must trust only the Traefik Docker network."
-    done
+    local proxy_error=""
+    if ! proxy_error="$(env_nginx_trusted_proxies_check "${env_ref[NGINX_TRUSTED_PROXIES]}" "${env_ref[DOCKER_PROXY_SUBNET]}" "${env_ref[DOCKER_PROXY_GATEWAY]}")"; then
+        fail "${proxy_error}"
+    fi
+    if ! proxy_error="$(env_traefik_proxy_address_check "$(env_traefik_proxy_address)" "${env_ref[DOCKER_PROXY_SUBNET]}" "${env_ref[DOCKER_PROXY_GATEWAY]}")"; then
+        fail "${proxy_error}"
+    fi
+    if ! proxy_error="$(env_nextcloud_trusted_proxies_check "${env_ref[TRUSTED_PROXIES]}" "${env_ref[DOCKER_PROXY_SUBNET]}")"; then
+        fail "${proxy_error}"
+    fi
 
     env_path_ok "POSTGRESQL_HOST_DIR" "${env_ref[POSTGRESQL_HOST_DIR]}"
     env_path_ok "NEXTCLOUD_DATA_HOST_DIR" "${env_ref[NEXTCLOUD_DATA_HOST_DIR]}"
@@ -385,7 +495,7 @@ env_load_runtime() {
         [[ -v RUNTIME_ENV["${key}"] ]] || fail "Missing variable: ${key}"
         if [[ -z "${RUNTIME_ENV[${key}]}" ]]; then
             case "${key}" in
-                NEXTCLOUD_SOURCE_DATA_DIR|PROXY_PROTOCOL_TRUSTED_IPS|TRAEFIK_ADMIN_PUBLISH|BACKUP_EXTERNAL_DIR|BACKUP_AGE_RECIPIENT|SMTP_HOST|SMTP_NAME|SMTP_PASSWORD|MAIL_FROM_ADDRESS|MAIL_DOMAIN)
+                NEXTCLOUD_SOURCE_DATA_DIR|TRUSTED_PROXIES|PROXY_PROTOCOL_TRUSTED_IPS|TRAEFIK_ADMIN_PUBLISH|BACKUP_EXTERNAL_DIR|BACKUP_AGE_RECIPIENT|SMTP_HOST|SMTP_NAME|SMTP_PASSWORD|MAIL_FROM_ADDRESS|MAIL_DOMAIN)
                     ;;
                 *) fail "Empty variable: ${key}" ;;
             esac
@@ -421,7 +531,11 @@ env_sync_file() {
         case "${policy}" in
             framework) ;;
             user)
-                if [[ -n "${existing}" ]]; then
+                # An old TRUSTED_PROXIES placeholder is not a chosen value.
+                # A real CIDR, password or other user value stays as it is.
+                if [[ "${key}" == "TRUSTED_PROXIES" ]] && { [[ -z "${existing}" ]] || env_is_placeholder "${existing}"; }; then
+                    :
+                elif [[ -n "${existing}" ]]; then
                     value="${existing}"
                 fi
                 ;;

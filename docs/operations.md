@@ -6,7 +6,8 @@
 
 - `POSTGRESQL_HOST_DIR` a `NEXTCLOUD_DATA_HOST_DIR`, dvě různé ne-vnořené absolutní cesty na disku `/docker-data`;
 - `DOCKER_PROXY_SUBNET`, `DOCKER_PROXY_GATEWAY`, `DOCKER_INTERNAL_SUBNET`, `DOCKER_INTERNAL_GATEWAY`, soukromé rozsahy s prefixem 16–28, které se nepřekrývají mezi sebou ani s existující Docker sítí;
-- `TRUSTED_PROXIES`, alespoň jeden CIDR ležící uvnitř `DOCKER_PROXY_SUBNET`;
+- `NGINX_TRUSTED_PROXIES`, CIDR uvnitř `DOCKER_PROXY_SUBNET`; výchozí je `172.18.0.2/32`, pevná adresa Traefiku na `lu-proxy`;
+- `TRUSTED_PROXIES` zůstává prázdné, Nextcloud v tomto nasazení HTTP proxy nedůvěřuje;
 - `ADMIN_IP_ALLOWLIST`, soukromé CIDR administrátorů;
 - `METABASE_IP_ALLOWLIST`, jednotlivé důvěryhodné adresy WireGuard klientů ve tvaru `/32`, které Traefik po DNAT bez SNAT uvidí jako TCP peer na entrypointu `metabase`; celá VPN síť se nezapisuje; hodnota `set_metabase_allowlist` se odmítne a z projektu ji nelze doplnit odhadem;
 - `METABASE_PUBLIC_URL` zůstává `https://10.100.100.1:9444`;

@@ -143,7 +143,7 @@ EOF
     {
         printf 'real_ip_header X-Forwarded-For;\nreal_ip_recursive on;\n'
         local cidr
-        for cidr in ${RUNTIME_ENV[TRUSTED_PROXIES]}; do
+        for cidr in ${RUNTIME_ENV[NGINX_TRUSTED_PROXIES]}; do
             printf 'set_real_ip_from %s;\n' "${cidr}"
         done
     } > "${realip}"
