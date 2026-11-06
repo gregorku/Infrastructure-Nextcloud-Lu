@@ -870,8 +870,77 @@ static_checks() {
     if env_path_nested "/data/nextcloud-pg" "/data/metabase-pg"; then
         fail_static "sibling paths were reported as nested"
     fi
+    check_deploy_database_order
     check_crowdsec_post_deploy
     ok "Static checks passed. Containers were not started."
+}
+
+check_deploy_database_order() {
+    local deploy_file="${REPO_ROOT}/scripts/deploy.sh"
+    local db_line role_line compose_line sql then_part else_part role_fn services_fn admin_fn password_arg
+    db_line="$(grep -n '^deploy_database_services$' "${deploy_file}" | head -n 1 | cut -d: -f1)"
+    role_line="$(grep -n '^deploy_postgres_role$' "${deploy_file}" | head -n 1 | cut -d: -f1)"
+    compose_line="$(grep -n '^deploy_compose$' "${deploy_file}" | head -n 1 | cut -d: -f1)"
+    [[ -n "${db_line}" && -n "${role_line}" && -n "${compose_line}" ]] \
+        || fail_static "database deploy steps are missing"
+    [[ "${db_line}" -lt "${role_line}" && "${role_line}" -lt "${compose_line}" ]] \
+        || fail_static "the database role is not ready before the full stack starts"
+    [[ "$((role_line - db_line))" -eq 1 && "$((compose_line - role_line))" -eq 1 ]] \
+        || fail_static "a failed database preparation can continue into the full stack"
+    [[ "$(sed -n '1,3p' "${deploy_file}")" == *'set -Eeuo pipefail'* ]] \
+        || fail_static "deploy does not stop on the first error"
+    [[ "$(declare -f fail)" == *'exit 1'* ]] \
+        || fail_static "a database preparation error does not abort deployment"
+    services_fn="$(declare -f deploy_database_services)"
+    [[ "${services_fn}" == *'postgresql redis'* ]] \
+        || fail_static "database phase does not start PostgreSQL and Redis"
+    [[ "${services_fn}" == *'--wait-timeout'* ]] \
+        || fail_static "database phase has no health timeout"
+    [[ "${services_fn}" != *'nextcloud'* && "${services_fn}" != *'--remove-orphans'* ]] \
+        || fail_static "database phase starts Nextcloud or removes containers"
+    [[ "${services_fn}" == *'|| fail "'* && "${services_fn}" != *'deploy_compose'* ]] \
+        || fail_static "an unhealthy database does not stop deployment"
+    [[ "$(declare -f deploy_compose)" == *'up -d --remove-orphans'* ]] \
+        || fail_static "the full stack no longer uses --remove-orphans"
+    sql="$(deploy_postgres_role_sql role)"
+    then_part="${sql%%ELSE*}"
+    else_part="${sql#*ELSE}"
+    password_arg="PASSWORD %L', :'app_user', :'app_pass')"
+    [[ "${sql}" == *'\getenv app_pass PGAPP_PASS'* && "${sql%%WHEN EXISTS*}" == *'\getenv app_pass PGAPP_PASS'* ]] \
+        || fail_static "the database password is not read from the environment"
+    [[ "${then_part}" == *'ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD %L'* ]] \
+        || fail_static "an existing database role does not get its password updated"
+    [[ "${then_part}" == *"${password_arg}"* ]] \
+        || fail_static "an existing role password is not passed through a quoted literal"
+    [[ "${else_part}" == *'CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD %L'* ]] \
+        || fail_static "a missing database role is not created"
+    [[ "${else_part}" == *"${password_arg}"* ]] \
+        || fail_static "a new role password is not passed through a quoted literal"
+    [[ "${sql}" == *'ALTER DATABASE %I OWNER TO %I'* ]] \
+        || fail_static "the database owner is not set"
+    [[ "$(deploy_postgres_role_sql schema)" == *'ALTER SCHEMA public OWNER TO %I'* ]] \
+        || fail_static "the public schema owner is not set"
+    [[ "${sql}" != *'DROP ROLE'* && "${sql}" != *'nc_bootstrap'* ]] \
+        || fail_static "the bootstrap role would be changed"
+    role_fn="$(declare -f deploy_postgres_role)"
+    [[ "${role_fn}" == *'POSTGRES_BOOTSTRAP_USER'* ]] \
+        || fail_static "the bootstrap role is not protected"
+    [[ "${role_fn}" == *'could not log in'* ]] \
+        || fail_static "the application login is not checked"
+    [[ "${role_fn}" != *'PASSWORD '"'"'${'* && "${role_fn}" != *'deploy_compose'* ]] \
+        || fail_static "the database password is interpolated into SQL"
+    [[ "${role_fn}" == *'|| fail "Unable to prepare the Nextcloud database role."'* ]] \
+        || fail_static "a role error does not stop deployment"
+    [[ "${role_fn}" == *'|| fail "Unable to set the Nextcloud schema owner."'* ]] \
+        || fail_static "a schema error does not stop deployment"
+    [[ "${role_fn}" == *'|| fail "Application role could not log in to ${db}."'* ]] \
+        || fail_static "a failed application login does not stop deployment"
+    admin_fn="$(declare -f deploy_postgres_admin_sql)"
+    [[ "${admin_fn}" == *'-e PGAPP_PASS='* && "${admin_fn}" != *'app_pass='* ]] \
+        || fail_static "the database password is a psql argument"
+    [[ "${admin_fn}" == *'exec psql -v ON_ERROR_STOP=1 -q '* ]] \
+        || fail_static "psql would echo the database password"
+    ok "Database services start before the Nextcloud role and the full stack"
 }
 
 case "${1:-}" in

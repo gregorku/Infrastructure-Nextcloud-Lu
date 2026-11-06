@@ -17,6 +17,7 @@ deploy_prepare_storage
 deploy_ensure_networks
 deploy_render_runtime
 deploy_check_dockge
-deploy_compose
+deploy_database_services
 deploy_postgres_role
+deploy_compose
 print_footer "Deployment completed. Next: ./scripts/post-deploy.sh"
