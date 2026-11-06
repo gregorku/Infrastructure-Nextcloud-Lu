@@ -457,29 +457,106 @@ post_deploy_stage_key() {
     [[ "${rc:-0}" -eq 0 ]]
 }
 
+crowdsec_probe_timeout_seconds() {
+    local value="${CROWDSEC_LAPI_PROBE_TIMEOUT:-5}"
+    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+        value=5
+    fi
+    printf '%s\n' "${value}"
+}
+
+# Temporary key files are removed on return, command failure, SIGINT and SIGTERM.
+# The caller's traps are saved and restored. A signal is raised again after cleanup.
+crowdsec_begin_private() {
+    crowdsec__priv_files=("$@")
+    crowdsec__priv_child=""
+    crowdsec__saved_umask="$(umask)"
+    crowdsec__saved_int="$(trap -p INT || true)"
+    crowdsec__saved_term="$(trap -p TERM || true)"
+    [[ -n "${crowdsec__saved_int}" ]] || crowdsec__saved_int='trap - INT'
+    [[ -n "${crowdsec__saved_term}" ]] || crowdsec__saved_term='trap - TERM'
+    trap 'crowdsec_private_on_signal INT' INT
+    trap 'crowdsec_private_on_signal TERM' TERM
+}
+
+crowdsec_kill_tree() {
+    local pid="$1" child
+    local IFS=$' \t\n'
+    if [[ -r "/proc/${pid}/task/${pid}/children" ]]; then
+        for child in $(<"/proc/${pid}/task/${pid}/children"); do
+            [[ "${child}" =~ ^[0-9]+$ ]] || continue
+            crowdsec_kill_tree "${child}"
+        done
+    fi
+    kill -KILL "${pid}" 2>/dev/null || true
+}
+
+crowdsec_private_release() {
+    local f child="${crowdsec__priv_child}"
+    if [[ -n "${child}" ]]; then
+        crowdsec__priv_child=""
+        crowdsec_kill_tree "${child}"
+        wait "${child}" 2>/dev/null || true
+    fi
+    if ((${#crowdsec__priv_files[@]})); then
+        for f in "${crowdsec__priv_files[@]}"; do
+            rm -f "${f}"
+        done
+    fi
+    crowdsec__priv_files=()
+    umask "${crowdsec__saved_umask}"
+    trap - INT TERM
+    eval "${crowdsec__saved_int}"
+    eval "${crowdsec__saved_term}"
+}
+
+crowdsec_end_private() {
+    crowdsec__priv_child=""
+    crowdsec_private_release
+}
+
+crowdsec_private_on_signal() {
+    local sig="$1"
+    crowdsec_private_release
+    # $$ stays the parent shell inside a subshell; BASHPID is this process.
+    kill -s "${sig}" "${BASHPID}"
+}
+
 post_deploy_write_bouncer_key() {
-    local key="$1" path dir tmp old_umask
+    local key="$1" path dir tmp
     post_deploy_key_format_ok "${key}" || return 1
     path="$(post_deploy_bouncer_key_path)"
     dir="${path%/*}"
-    mkdir -p "${dir}" || return 1
-    chmod 700 "${dir}" || return 1
-    old_umask="$(umask)"
+    crowdsec_begin_private
     umask 077
-    tmp="$(mktemp "${dir}/.bouncer-key.XXXXXX")" || { umask "${old_umask}"; return 1; }
+    if ! mkdir -p "${dir}"; then
+        crowdsec_end_private
+        return 1
+    fi
+    if ! chmod 700 "${dir}"; then
+        crowdsec_end_private
+        return 1
+    fi
+    tmp="$(mktemp "${dir}/.bouncer-key.XXXXXX")" || { crowdsec_end_private; return 1; }
+    crowdsec__priv_files=("${tmp}")
     if ! printf '%s\n' "${key}" > "${tmp}"; then
-        rm -f "${tmp}"
-        umask "${old_umask}"
+        crowdsec_end_private
         return 1
     fi
-    chmod 600 "${tmp}" || { rm -f "${tmp}"; umask "${old_umask}"; return 1; }
+    if ! chmod 600 "${tmp}"; then
+        crowdsec_end_private
+        return 1
+    fi
     if ! mv -f "${tmp}" "${path}"; then
-        rm -f "${tmp}"
-        umask "${old_umask}"
+        crowdsec_end_private
         return 1
     fi
-    chmod 600 "${path}" || { umask "${old_umask}"; return 1; }
-    umask "${old_umask}"
+    crowdsec__priv_files=()
+    if ! chmod 600 "${path}"; then
+        crowdsec_end_private
+        return 1
+    fi
+    crowdsec_end_private
 }
 
 post_deploy_store_generated_key() {
@@ -539,23 +616,33 @@ crowdsec_bouncer_registered() {
 }
 
 crowdsec_probe_once() {
-    local keyfile="$1" staged status code rc
+    local keyfile="$1" staged out timeout_seconds rc=0 status code
+    timeout_seconds="$(crowdsec_probe_timeout_seconds)"
     staged="$(mktemp)"
-    chmod 600 "${staged}"
+    out="$(mktemp)"
+    chmod 600 "${staged}" "${out}"
+    crowdsec_begin_private "${staged}" "${out}"
     if ! post_deploy_stage_key "${keyfile}" "${staged}"; then
-        rm -f "${staged}"
+        crowdsec_end_private
         return 1
     fi
-    status="$(
+    command -v timeout >/dev/null 2>&1 || { crowdsec_end_private; return 1; }
+    timeout -k 1 "${timeout_seconds}" \
         docker exec -i "${CROWDSEC_CONTAINER}" \
-            bash -c 'IFS= read -r key || exit 2
+        bash -c 'IFS= read -r key || exit 2
 [[ -n "${key}" ]] || exit 2
 exec 3<>/dev/tcp/crowdsec/8080 || exit 3
 printf "GET /v1/decisions HTTP/1.0\r\nHost: crowdsec:8080\r\nX-Api-Key: %s\r\nConnection: close\r\n\r\n" "${key}" >&3
 IFS= read -r line <&3 || exit 4
-printf "%s\n" "${line}"' < "${staged}"
-    )" && rc=0 || rc=$?
-    rm -f "${staged}"
+printf "%s\n" "${line}"' < "${staged}" > "${out}" &
+    crowdsec__priv_child=$!
+    set +e
+    wait "${crowdsec__priv_child}"
+    rc=$?
+    set -e
+    crowdsec__priv_child=""
+    status="$(<"${out}")" || status=""
+    crowdsec_end_private
     [[ "${rc}" -eq 0 ]] || return 1
     code="$(printf '%s\n' "${status}" | awk 'NR == 1 { print $2 }')"
     code="${code//$'\r'/}"
@@ -587,34 +674,46 @@ crowdsec_probe_key_file() {
 }
 
 crowdsec_add_key_file() {
-    local keyfile="$1" staged err
+    local keyfile="$1" staged err rc=0
     staged="$(mktemp)"
     err="$(mktemp)"
     chmod 600 "${staged}" "${err}"
+    crowdsec_begin_private "${staged}" "${err}"
     if ! post_deploy_stage_key "${keyfile}" "${staged}"; then
-        rm -f "${staged}" "${err}"
+        crowdsec_end_private
         return 1
     fi
-    if ! docker exec -i "${CROWDSEC_CONTAINER}" \
+    docker exec -i "${CROWDSEC_CONTAINER}" \
         bash -c 'IFS= read -r key || exit 2
 [[ -n "${key}" ]] || exit 2
 cscli bouncers add "$1" --key "${key}" >/dev/null' \
-        bash "${CROWDSEC_BOUNCER_NAME}" < "${staged}" 2>"${err}"; then
-        rm -f "${staged}" "${err}"
-        return 1
-    fi
-    rm -f "${staged}" "${err}"
+        bash "${CROWDSEC_BOUNCER_NAME}" < "${staged}" 2>"${err}" &
+    crowdsec__priv_child=$!
+    set +e
+    wait "${crowdsec__priv_child}"
+    rc=$?
+    set -e
+    crowdsec__priv_child=""
+    crowdsec_end_private
+    return "${rc}"
 }
 
 crowdsec_generate_key() {
-    local err key
+    local err out key rc=0
     err="$(mktemp)"
-    chmod 600 "${err}"
-    if ! key="$(docker exec "${CROWDSEC_CONTAINER}" cscli bouncers add "${CROWDSEC_BOUNCER_NAME}" -o raw 2>"${err}")"; then
-        rm -f "${err}"
-        return 1
-    fi
-    rm -f "${err}"
+    out="$(mktemp)"
+    chmod 600 "${err}" "${out}"
+    crowdsec_begin_private "${err}" "${out}"
+    docker exec "${CROWDSEC_CONTAINER}" cscli bouncers add "${CROWDSEC_BOUNCER_NAME}" -o raw > "${out}" 2>"${err}" &
+    crowdsec__priv_child=$!
+    set +e
+    wait "${crowdsec__priv_child}"
+    rc=$?
+    set -e
+    crowdsec__priv_child=""
+    key="$(<"${out}")" || key=""
+    crowdsec_end_private
+    [[ "${rc}" -eq 0 ]] || return 1
     key="$(printf '%s' "${key}" | tr -d '[:space:]')"
     post_deploy_key_format_ok "${key}" || return 1
     printf '%s\n' "${key}"

@@ -102,6 +102,8 @@ assert_crowdsec_absent() {
 check_crowdsec_post_deploy() {
     local got path expected
     CROWDSEC_TEST_ROOT="$(mktemp -d)"
+    eval "$(declare -f crowdsec_probe_once | sed '1s/^crowdsec_probe_once /crowdsec_probe_once_real /')"
+    eval "$(declare -f crowdsec_probe_key_file | sed '1s/^crowdsec_probe_key_file /crowdsec_probe_key_file_real /')"
     expect_crowdsec_action() {
         got="$(post_deploy_crowdsec_action "$1" "$2" "${3:-}")"
         [[ "${got}" == "$4" ]] || crowdsec_static_fail "action ${1}/${2}/${3:-<none>} was ${got}"
@@ -333,11 +335,14 @@ check_crowdsec_post_deploy() {
     local old_umask
     old_umask="$(umask)"
     umask 022
+    local open_umask
+    open_umask="$(umask)"
     post_deploy_bouncer_key_path() { printf '%s\n' "${CROWDSEC_TEST_ROOT}/direct/BOUNCER_KEY_lu-traefik"; }
     if ! post_deploy_write_bouncer_key "${CROWDSEC_FIXTURE_KEY}"; then
         umask "${old_umask}"
         crowdsec_static_fail "atomic key write failed"
     fi
+    [[ "$(umask)" == "${open_umask}" ]] || crowdsec_static_fail "umask was not restored after creating the key directory"
     [[ "$(stat -c '%a' "${CROWDSEC_TEST_ROOT}/direct")" == 700 ]] || crowdsec_static_fail "direct key directory was not mode 700"
     [[ "$(stat -c '%a' "${CROWDSEC_TEST_ROOT}/direct/BOUNCER_KEY_lu-traefik")" == 600 ]] \
         || crowdsec_static_fail "direct key file was not mode 600"
@@ -371,9 +376,128 @@ check_crowdsec_post_deploy() {
     }
     run_crowdsec crowdsec_container_stopped
     assert_crowdsec_status fail "stopped CrowdSec container"
+    assert_crowdsec_absent trace "stopped container attempted an LAPI check"
     assert_crowdsec_absent deleted "stopped container removed a bouncer"
     assert_crowdsec_absent generated "stopped container generated a key"
+    assert_crowdsec_absent restart "stopped container restarted Traefik"
     ok "CrowdSec stops when lu-crowdsec is not running"
+
+    crowdsec_make_fake_docker() {
+        local body="$1"
+        mkdir -p "${CROWDSEC_TEST_ROOT}/bin" "${CROWDSEC_TEST_ROOT}/tmp"
+        chmod 700 "${CROWDSEC_TEST_ROOT}/bin" "${CROWDSEC_TEST_ROOT}/tmp"
+        printf '%s\n' '#!/usr/bin/env bash' "${body}" > "${CROWDSEC_TEST_ROOT}/bin/docker"
+        chmod 755 "${CROWDSEC_TEST_ROOT}/bin/docker"
+    }
+    crowdsec_prepare_probe_key() {
+        mkdir -p "${CROWDSEC_TEST_ROOT}/probe"
+        chmod 700 "${CROWDSEC_TEST_ROOT}/probe"
+        printf '%s\n' "${CROWDSEC_FIXTURE_KEY}" > "${CROWDSEC_TEST_ROOT}/probe/key"
+        chmod 600 "${CROWDSEC_TEST_ROOT}/probe/key"
+    }
+
+    local saved_term probe_out probe_rc
+    saved_term="$(trap -p TERM || true)"
+    trap 'printf parent-term\n' TERM
+    crowdsec_make_fake_docker "printf '%s\n' 'HTTP/1.0 403 Forbidden'"
+    crowdsec_prepare_probe_key
+    if PATH="${CROWDSEC_TEST_ROOT}/bin:${PATH}" \
+        TMPDIR="${CROWDSEC_TEST_ROOT}/tmp" \
+        crowdsec_probe_once_real "${CROWDSEC_TEST_ROOT}/probe/key" > "${CROWDSEC_TEST_ROOT}/probe.out"
+    then
+        probe_rc=0
+    else
+        probe_rc=$?
+    fi
+    probe_out="$(<"${CROWDSEC_TEST_ROOT}/probe.out")"
+    [[ "${probe_rc}" -eq 0 && "${probe_out}" == 403 ]] || crowdsec_static_fail "HTTP 403 was not reported as 403"
+    [[ "$(trap -p TERM || true)" == *"parent-term"* ]] || crowdsec_static_fail "LAPI probe replaced the caller TERM trap"
+    if find "${CROWDSEC_TEST_ROOT}/tmp" -type f -print | grep -q .; then
+        crowdsec_static_fail "403 probe left a temporary key file"
+    fi
+    if [[ -n "${saved_term}" ]]; then
+        eval "${saved_term}"
+    else
+        trap - TERM
+    fi
+    ok "CrowdSec HTTP 403 stays distinct and the caller trap is restored"
+
+    local started elapsed
+    started="${SECONDS}"
+    crowdsec_make_fake_docker "sleep 30"
+    set +e
+    probe_out="$(
+        PATH="${CROWDSEC_TEST_ROOT}/bin:${PATH}" \
+        TMPDIR="${CROWDSEC_TEST_ROOT}/tmp" \
+        CROWDSEC_LAPI_PROBE_TIMEOUT=1 \
+        crowdsec_probe_once_real "${CROWDSEC_TEST_ROOT}/probe/key"
+    )"
+    probe_rc=$?
+    set -e
+    elapsed=$((SECONDS - started))
+    [[ "${probe_rc}" -ne 0 ]] || crowdsec_static_fail "hung LAPI probe was accepted"
+    [[ "${probe_out}" != 403 && "${probe_out}" != 200 ]] || crowdsec_static_fail "hung LAPI probe returned an HTTP decision"
+    [[ "${elapsed}" -lt 5 ]] || crowdsec_static_fail "hung LAPI probe exceeded its timeout"
+    if find "${CROWDSEC_TEST_ROOT}/tmp" -type f -print | grep -q .; then
+        crowdsec_static_fail "timed out probe left a temporary key file"
+    fi
+    ok "CrowdSec LAPI probe stops when the HTTP request hangs"
+
+    crowdsec_lapi_timeout() {
+        crowdsec_defaults
+        crowdsec_bouncer_registered() { return 0; }
+        crowdsec_probe_key_file() { CROWDSEC_LAPI_ATTEMPTS=1 CROWDSEC_LAPI_DELAY=0 crowdsec_probe_key_file_real "$@"; }
+        crowdsec_prepare_key "${CROWDSEC_FIXTURE_KEY}"
+        crowdsec_make_fake_docker "sleep 30"
+        PATH="${CROWDSEC_TEST_ROOT}/bin:${PATH}" \
+        TMPDIR="${CROWDSEC_TEST_ROOT}/tmp" \
+        CROWDSEC_LAPI_PROBE_TIMEOUT=1 \
+        post_deploy_crowdsec
+    }
+    started="${SECONDS}"
+    run_crowdsec crowdsec_lapi_timeout
+    [[ $((SECONDS - started)) -lt 5 ]] || crowdsec_static_fail "LAPI timeout did not stop the hung request"
+    assert_crowdsec_status fail "LAPI timeout"
+    assert_crowdsec_absent deleted "LAPI timeout removed a bouncer"
+    assert_crowdsec_absent generated "LAPI timeout generated a key"
+    assert_crowdsec_absent restart "LAPI timeout restarted Traefik"
+    ok "CrowdSec timeout does not change the bouncer or Traefik"
+
+    crowdsec_make_fake_docker "sleep 30"
+    crowdsec_prepare_probe_key
+    local probe_pid
+    PATH="${CROWDSEC_TEST_ROOT}/bin:${PATH}" \
+    TMPDIR="${CROWDSEC_TEST_ROOT}/tmp" \
+    CROWDSEC_LAPI_PROBE_TIMEOUT=30 \
+        crowdsec_probe_once_real "${CROWDSEC_TEST_ROOT}/probe/key" &
+    probe_pid=$!
+    local seen="" i
+    for ((i = 0; i < 50; i++)); do
+        if find "${CROWDSEC_TEST_ROOT}/tmp" -type f -print | grep -q .; then
+            seen=yes
+            break
+        fi
+        sleep 0.05
+    done
+    [[ "${seen}" == yes ]] || crowdsec_static_fail "probe did not create a temporary key file"
+    sleep 0.2
+    kill -TERM "${probe_pid}" 2>/dev/null || true
+    for ((i = 0; i < 20; i++)); do
+        if ! kill -0 "${probe_pid}" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    if kill -0 "${probe_pid}" 2>/dev/null; then
+        kill -KILL "${probe_pid}" 2>/dev/null || true
+        wait "${probe_pid}" 2>/dev/null || true
+        crowdsec_static_fail "interrupting the LAPI probe did not stop it"
+    fi
+    wait "${probe_pid}" 2>/dev/null || true
+    if find "${CROWDSEC_TEST_ROOT}/tmp" -type f -print | grep -q .; then
+        crowdsec_static_fail "interrupting the LAPI probe left a temporary key file"
+    fi
+    ok "CrowdSec removes temporary key files when the probe is interrupted"
 
     rm -rf "${CROWDSEC_TEST_ROOT}"
     CROWDSEC_TEST_ROOT=""
