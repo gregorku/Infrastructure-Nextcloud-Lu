@@ -340,33 +340,417 @@ deploy_postgres_role() {
     ok "Application role is present. The bootstrap superuser was not removed."
 }
 
-post_deploy_crowdsec() {
-    print_section "CrowdSec bouncer"
-    docker inspect -f '{{.State.Running}}' "${CROWDSEC_CONTAINER}" | grep -qx true || fail "CrowdSec is not running."
+post_deploy_bouncer_key_path() {
+    printf '%s\n' "${BOUNCER_KEY_FILE}"
+}
+
+post_deploy_key_format_ok() {
+    local key="$1"
+    [[ "${#key}" -ge 20 && "${#key}" -le 200 ]] || return 1
+    [[ "${key}" =~ ^[A-Za-z0-9+/=_-]+$ ]]
+}
+
+post_deploy_key_trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "${value}"
+}
+
+post_deploy_key_file_state() {
+    local path="$1" raw trimmed
+    [[ -f "${path}" ]] || { printf '%s\n' missing; return 0; }
+    raw="$(<"${path}")" || raw=""
+    trimmed="$(post_deploy_key_trim "${raw}")"
+    if [[ -z "${trimmed}" ]]; then
+        printf '%s\n' empty
+        return 0
+    fi
+    if post_deploy_key_format_ok "${trimmed}"; then
+        printf '%s\n' valid
+    else
+        printf '%s\n' invalid
+    fi
+}
+
+# Restart when Traefik cannot be shown to have started after the key file.
+# Equal epochs stay on the restart side: file mtime and StartedAt can share a second.
+post_deploy_restart_needed() {
+    local file_epoch="$1" started_epoch="$2"
+    [[ "${file_epoch}" =~ ^[0-9]+$ && "${started_epoch}" =~ ^[0-9]+$ ]] || return 0
+    if (( started_epoch > file_epoch )); then
+        return 1
+    fi
+    return 0
+}
+
+post_deploy_raw_has_bouncer() {
+    local wanted="$1" line name
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line//$'\r'/}"
+        [[ -z "${line}" || "${line}" == name,* || "${line}" == Name,* ]] && continue
+        name="${line%%,*}"
+        [[ "${name}" == "${wanted}" ]] && return 0
+    done
+    return 1
+}
+
+post_deploy_deletable_bouncer() {
+    [[ "$1" == "${CROWDSEC_BOUNCER_NAME}" ]]
+}
+
+# valid|missing|empty|invalid, yes|no, 200|403|other
+post_deploy_crowdsec_action() {
+    local key_state="$1" registered="$2" http="${3:-}"
+    case "${key_state}" in
+        invalid)
+            printf '%s\n' refuse-invalid
+            ;;
+        valid)
+            case "${http}" in
+                200)
+                    if [[ "${registered}" == yes ]]; then
+                        printf '%s\n' keep
+                    else
+                        printf '%s\n' register-existing
+                    fi
+                    ;;
+                403)
+                    if [[ "${registered}" == yes ]]; then
+                        printf '%s\n' repair-existing
+                    else
+                        printf '%s\n' register-existing
+                    fi
+                    ;;
+                *)
+                    printf '%s\n' abort-lapi
+                    ;;
+            esac
+            ;;
+        missing|empty)
+            if [[ "${registered}" == yes ]]; then
+                printf '%s\n' replace-registered
+            else
+                printf '%s\n' create-new
+            fi
+            ;;
+        *)
+            printf '%s\n' abort-lapi
+            ;;
+    esac
+}
+
+post_deploy_stage_key() {
+    local src="$1" dest="$2" raw trimmed old_umask rc
+    [[ -f "${src}" ]] || return 1
+    raw="$(<"${src}")" || return 1
+    trimmed="$(post_deploy_key_trim "${raw}")"
+    post_deploy_key_format_ok "${trimmed}" || return 1
+    old_umask="$(umask)"
+    umask 077
+    if ! printf '%s\n' "${trimmed}" > "${dest}"; then
+        umask "${old_umask}"
+        return 1
+    fi
+    chmod 600 "${dest}" || rc=1
+    umask "${old_umask}"
+    [[ "${rc:-0}" -eq 0 ]]
+}
+
+post_deploy_write_bouncer_key() {
+    local key="$1" path dir tmp old_umask
+    post_deploy_key_format_ok "${key}" || return 1
+    path="$(post_deploy_bouncer_key_path)"
+    dir="${path%/*}"
+    mkdir -p "${dir}" || return 1
+    chmod 700 "${dir}" || return 1
+    old_umask="$(umask)"
+    umask 077
+    tmp="$(mktemp "${dir}/.bouncer-key.XXXXXX")" || { umask "${old_umask}"; return 1; }
+    if ! printf '%s\n' "${key}" > "${tmp}"; then
+        rm -f "${tmp}"
+        umask "${old_umask}"
+        return 1
+    fi
+    chmod 600 "${tmp}" || { rm -f "${tmp}"; umask "${old_umask}"; return 1; }
+    if ! mv -f "${tmp}" "${path}"; then
+        rm -f "${tmp}"
+        umask "${old_umask}"
+        return 1
+    fi
+    chmod 600 "${path}" || { umask "${old_umask}"; return 1; }
+    umask "${old_umask}"
+}
+
+post_deploy_store_generated_key() {
+    local key=""
+    if ! key="$(crowdsec_generate_key)"; then
+        return 1
+    fi
+    post_deploy_key_format_ok "${key}" || return 1
+    post_deploy_write_bouncer_key "${key}"
+}
+
+crowdsec_container_state() {
+    local running
+    if ! running="$(docker inspect -f '{{.State.Running}}' "${CROWDSEC_CONTAINER}" 2>/dev/null)"; then
+        printf '%s\n' missing
+        return 0
+    fi
+    if [[ "${running}" == true ]]; then
+        printf '%s\n' running
+    else
+        printf '%s\n' stopped
+    fi
+}
+
+crowdsec_wait_lapi() {
+    local attempts="${CROWDSEC_LAPI_ATTEMPTS:-5}" i
+    for ((i = 1; i <= attempts; i++)); do
+        if docker exec "${CROWDSEC_CONTAINER}" cscli bouncers list -o raw >/dev/null 2>&1; then
+            return 0
+        fi
+        if (( i < attempts )); then
+            sleep "${CROWDSEC_LAPI_DELAY:-1}"
+        fi
+    done
+    return 1
+}
+
+post_deploy_install_collections() {
     local collection
     for collection in crowdsecurity/linux crowdsecurity/traefik; do
         if docker exec "${CROWDSEC_CONTAINER}" cscli collections inspect "${collection}" >/dev/null 2>&1; then
             ok "Collection already present: ${collection}"
-        else
-            docker exec "${CROWDSEC_CONTAINER}" cscli collections install "${collection}" >/dev/null
+        elif docker exec "${CROWDSEC_CONTAINER}" cscli collections install "${collection}" >/dev/null; then
             ok "Collection installed: ${collection}"
+        else
+            fail "Unable to install CrowdSec collection ${collection}. No bouncer was changed."
         fi
     done
-    if [[ -f "${BOUNCER_KEY_FILE}" ]]; then
-        ok "Bouncer key already exists and was not replaced."
-        return 0
+}
+
+crowdsec_bouncer_registered() {
+    local raw
+    if ! raw="$(docker exec "${CROWDSEC_CONTAINER}" cscli bouncers list -o raw 2>/dev/null)"; then
+        return 2
     fi
-    local key
-    if ! key="$(docker exec "${CROWDSEC_CONTAINER}" cscli bouncers add "${CROWDSEC_BOUNCER_NAME}" -o raw)"; then
-        fail "Unable to create bouncer ${CROWDSEC_BOUNCER_NAME}. Existing bouncers were not removed."
+    printf '%s\n' "${raw}" | post_deploy_raw_has_bouncer "${CROWDSEC_BOUNCER_NAME}"
+}
+
+crowdsec_probe_once() {
+    local keyfile="$1" staged status code rc
+    staged="$(mktemp)"
+    chmod 600 "${staged}"
+    if ! post_deploy_stage_key "${keyfile}" "${staged}"; then
+        rm -f "${staged}"
+        return 1
     fi
+    status="$(
+        docker exec -i "${CROWDSEC_CONTAINER}" \
+            bash -c 'IFS= read -r key || exit 2
+[[ -n "${key}" ]] || exit 2
+exec 3<>/dev/tcp/crowdsec/8080 || exit 3
+printf "GET /v1/decisions HTTP/1.0\r\nHost: crowdsec:8080\r\nX-Api-Key: %s\r\nConnection: close\r\n\r\n" "${key}" >&3
+IFS= read -r line <&3 || exit 4
+printf "%s\n" "${line}"' < "${staged}"
+    )" && rc=0 || rc=$?
+    rm -f "${staged}"
+    [[ "${rc}" -eq 0 ]] || return 1
+    code="$(printf '%s\n' "${status}" | awk 'NR == 1 { print $2 }')"
+    code="${code//$'\r'/}"
+    [[ "${code}" =~ ^[0-9]{3}$ ]] || return 1
+    printf '%s\n' "${code}"
+}
+
+crowdsec_probe_key_file() {
+    local keyfile="$1" attempts="${CROWDSEC_LAPI_ATTEMPTS:-5}" i code=""
+    for ((i = 1; i <= attempts; i++)); do
+        if code="$(crowdsec_probe_once "${keyfile}")"; then
+            case "${code}" in
+                200|403)
+                    printf '%s\n' "${code}"
+                    return 0
+                    ;;
+            esac
+        else
+            code=""
+        fi
+        if (( i < attempts )); then
+            sleep "${CROWDSEC_LAPI_DELAY:-1}"
+        fi
+    done
+    if [[ "${code}" =~ ^[0-9]{3}$ ]]; then
+        printf '%s\n' "${code}"
+    fi
+    return 1
+}
+
+crowdsec_add_key_file() {
+    local keyfile="$1" staged err
+    staged="$(mktemp)"
+    err="$(mktemp)"
+    chmod 600 "${staged}" "${err}"
+    if ! post_deploy_stage_key "${keyfile}" "${staged}"; then
+        rm -f "${staged}" "${err}"
+        return 1
+    fi
+    if ! docker exec -i "${CROWDSEC_CONTAINER}" \
+        bash -c 'IFS= read -r key || exit 2
+[[ -n "${key}" ]] || exit 2
+cscli bouncers add "$1" --key "${key}" >/dev/null' \
+        bash "${CROWDSEC_BOUNCER_NAME}" < "${staged}" 2>"${err}"; then
+        rm -f "${staged}" "${err}"
+        return 1
+    fi
+    rm -f "${staged}" "${err}"
+}
+
+crowdsec_generate_key() {
+    local err key
+    err="$(mktemp)"
+    chmod 600 "${err}"
+    if ! key="$(docker exec "${CROWDSEC_CONTAINER}" cscli bouncers add "${CROWDSEC_BOUNCER_NAME}" -o raw 2>"${err}")"; then
+        rm -f "${err}"
+        return 1
+    fi
+    rm -f "${err}"
     key="$(printf '%s' "${key}" | tr -d '[:space:]')"
-    [[ "${key}" =~ ^[A-Za-z0-9+/=_-]{20,}$ ]] || fail "Bouncer key was not written because its format was not recognized."
-    umask 077
-    printf '%s\n' "${key}" > "${BOUNCER_KEY_FILE}"
-    chmod 600 "${BOUNCER_KEY_FILE}"
+    post_deploy_key_format_ok "${key}" || return 1
+    printf '%s\n' "${key}"
+}
+
+crowdsec_delete_bouncer() {
+    local name="$1"
+    if ! post_deploy_deletable_bouncer "${name}"; then
+        return 1
+    fi
+    if ! docker exec "${CROWDSEC_CONTAINER}" cscli bouncers delete "${name}" >/dev/null; then
+        return 1
+    fi
+}
+
+traefik_started_raw() {
+    docker inspect -f '{{.State.StartedAt}}' "${TRAEFIK_CONTAINER}"
+}
+
+traefik_restart() {
     docker restart "${TRAEFIK_CONTAINER}" >/dev/null
-    ok "Bouncer key stored and Traefik restarted. The key was not logged."
+}
+
+post_deploy_restart_traefik_if_needed() {
+    local path file_epoch started_raw started_epoch
+    path="$(post_deploy_bouncer_key_path)"
+    [[ -f "${path}" ]] || fail "Bouncer key file is missing, so Traefik was not restarted."
+    file_epoch="$(stat -c '%Y' "${path}")"
+    if ! started_raw="$(traefik_started_raw)"; then
+        fail "Traefik start time is unavailable. The next run will retry the restart."
+    fi
+    if ! started_epoch="$(date -u -d "${started_raw}" +%s)"; then
+        fail "Traefik start time could not be read. The next run will retry the restart."
+    fi
+    if post_deploy_restart_needed "${file_epoch}" "${started_epoch}"; then
+        if ! traefik_restart; then
+            fail "Traefik restart failed. The next run will retry the restart."
+        fi
+        ok "Traefik restarted to load the bouncer key."
+    else
+        ok "Traefik already started after the bouncer key. It was not restarted."
+    fi
+}
+
+post_deploy_crowdsec() {
+    print_section "CrowdSec bouncer"
+    local state path dir key_state registered list_rc http action
+    state="$(crowdsec_container_state)"
+    case "${state}" in
+        running) ;;
+        missing) fail "CrowdSec container ${CROWDSEC_CONTAINER} does not exist. No bouncer was changed." ;;
+        *) fail "CrowdSec container ${CROWDSEC_CONTAINER} is not running. No bouncer was changed." ;;
+    esac
+    if ! crowdsec_wait_lapi; then
+        fail "CrowdSec LAPI is not ready. No bouncer was changed."
+    fi
+    post_deploy_install_collections
+    path="$(post_deploy_bouncer_key_path)"
+    key_state="$(post_deploy_key_file_state "${path}")"
+    if [[ "${key_state}" == invalid ]]; then
+        fail "Bouncer key file is not empty but its format is not recognized. It was not replaced."
+    fi
+    dir="${path%/*}"
+    mkdir -p "${dir}"
+    chmod 700 "${dir}"
+    registered=no
+    if crowdsec_bouncer_registered; then
+        registered=yes
+    else
+        list_rc=$?
+        if [[ "${list_rc}" -eq 2 ]]; then
+            fail "CrowdSec LAPI bouncer list failed. No bouncer was changed."
+        fi
+        registered=no
+    fi
+    http=""
+    if [[ "${key_state}" == valid ]]; then
+        if ! http="$(crowdsec_probe_key_file "${path}")"; then
+            if [[ "${http}" =~ ^[0-9]{3}$ ]]; then
+                fail "CrowdSec LAPI returned status ${http}. No bouncer was changed."
+            fi
+            fail "CrowdSec LAPI did not answer the key check. No bouncer was changed."
+        fi
+        if [[ "${http}" != 200 && "${http}" != 403 ]]; then
+            fail "CrowdSec LAPI returned status ${http}. No bouncer was changed."
+        fi
+    fi
+    action="$(post_deploy_crowdsec_action "${key_state}" "${registered}" "${http}")"
+    case "${action}" in
+        refuse-invalid)
+            fail "Bouncer key file is not empty but its format is not recognized. It was not replaced."
+            ;;
+        abort-lapi)
+            fail "CrowdSec LAPI did not accept a key check. No bouncer was changed."
+            ;;
+        keep)
+            chmod 600 "${path}"
+            ok "Bouncer key already matches LAPI and was not replaced."
+            ;;
+        register-existing)
+            if ! crowdsec_add_key_file "${path}"; then
+                fail "Unable to register the existing bouncer key. The key file was not replaced."
+            fi
+            chmod 600 "${path}"
+            ok "Existing bouncer key registered. The key was not logged."
+            ;;
+        repair-existing)
+            if ! crowdsec_delete_bouncer "${CROWDSEC_BOUNCER_NAME}"; then
+                fail "Unable to replace bouncer ${CROWDSEC_BOUNCER_NAME}. Other bouncers were not removed and the key file was not replaced."
+            fi
+            if ! crowdsec_add_key_file "${path}"; then
+                fail "Bouncer ${CROWDSEC_BOUNCER_NAME} was removed and the existing key could not be registered again. The key file was not replaced."
+            fi
+            chmod 600 "${path}"
+            ok "Bouncer registration now uses the stored key. The key was not logged."
+            ;;
+        replace-registered)
+            if ! crowdsec_delete_bouncer "${CROWDSEC_BOUNCER_NAME}"; then
+                fail "Unable to remove bouncer ${CROWDSEC_BOUNCER_NAME}. No new key was written."
+            fi
+            if ! post_deploy_store_generated_key; then
+                fail "Unable to create a new bouncer key. No partial key was written."
+            fi
+            ok "New bouncer key stored. The key was not logged."
+            ;;
+        create-new)
+            if ! post_deploy_store_generated_key; then
+                fail "Unable to create bouncer ${CROWDSEC_BOUNCER_NAME}. No partial key was written."
+            fi
+            ok "Bouncer key stored. The key was not logged."
+            ;;
+        *)
+            fail "Unknown CrowdSec bouncer action. No bouncer was changed."
+            ;;
+    esac
+    post_deploy_restart_traefik_if_needed
 }
 
 post_deploy_record_version() {

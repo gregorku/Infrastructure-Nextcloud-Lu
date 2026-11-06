@@ -164,6 +164,52 @@ env_ip_private() {
     return 1
 }
 
+# Space-separated single private IPv4 /32 addresses. Prints one reason and returns 1.
+env_metabase_allowlist_check() {
+    local list="$1" allow count=0
+    local IFS=$' \t\n'
+    if [[ -z "${list}" || "${list}" =~ ^[[:space:]]+$ ]]; then
+        printf '%s\n' "METABASE_IP_ALLOWLIST is empty."
+        return 1
+    fi
+    if env_is_placeholder "${list}"; then
+        printf '%s\n' "METABASE_IP_ALLOWLIST is still a placeholder."
+        return 1
+    fi
+    # shellcheck disable=SC2086
+    for allow in ${list}; do
+        if env_is_placeholder "${allow}"; then
+            printf '%s\n' "METABASE_IP_ALLOWLIST is still a placeholder."
+            return 1
+        fi
+        if ! env_cidr_ok "${allow}"; then
+            printf '%s\n' "Invalid METABASE_IP_ALLOWLIST CIDR: ${allow}"
+            return 1
+        fi
+        if [[ "${allow}" == "0.0.0.0/0" ]]; then
+            printf '%s\n' "METABASE_IP_ALLOWLIST must not be 0.0.0.0/0."
+            return 1
+        fi
+        if [[ "${allow}" != */32 ]]; then
+            printf '%s\n' "METABASE_IP_ALLOWLIST ${allow} must be a single /32 address."
+            return 1
+        fi
+        if ! env_ip_private "${allow%/*}"; then
+            printf '%s\n' "METABASE_IP_ALLOWLIST must be a private address: ${allow}"
+            return 1
+        fi
+        count=$((count + 1))
+    done
+    if [[ "${count}" -eq 0 ]]; then
+        printf '%s\n' "METABASE_IP_ALLOWLIST is empty."
+        return 1
+    fi
+}
+
+env_metabase_allowlist_ok() {
+    env_metabase_allowlist_check "$1" >/dev/null
+}
+
 env_cidr_overlaps() {
     local a="$1" b="$2"
     env_cidr_contains_ip "${a}" "${b%/*}" && return 0
@@ -307,13 +353,10 @@ env_validate_runtime() {
         env_ip_private "${allow%/*}" || fail "ADMIN_IP_ALLOWLIST must be a private range."
     done
 
-    [[ -n "${env_ref[METABASE_IP_ALLOWLIST]}" ]] || fail "METABASE_IP_ALLOWLIST is empty."
-    local metabase_allow
-    for metabase_allow in ${env_ref[METABASE_IP_ALLOWLIST]}; do
-        env_cidr_ok "${metabase_allow}" || fail "Invalid METABASE_IP_ALLOWLIST CIDR: ${metabase_allow}"
-        [[ "${metabase_allow}" != "0.0.0.0/0" ]] || fail "METABASE_IP_ALLOWLIST must not be 0.0.0.0/0."
-        env_ip_private "${metabase_allow%/*}" || fail "METABASE_IP_ALLOWLIST must be a private range."
-    done
+    local metabase_error=""
+    if ! metabase_error="$(env_metabase_allowlist_check "${env_ref[METABASE_IP_ALLOWLIST]}")"; then
+        fail "${metabase_error}"
+    fi
 
     [[ "${env_ref[METABASE_PUBLIC_URL]}" == "https://10.100.100.1:9444" ]] \
         || fail "METABASE_PUBLIC_URL must be https://10.100.100.1:9444."
