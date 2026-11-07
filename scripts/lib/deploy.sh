@@ -641,26 +641,38 @@ crowdsec_wait_lapi() {
     return 1
 }
 
-post_deploy_install_collections() {
+deploy_crowdsec_install_collections() {
+    print_section "CrowdSec collections"
+
     local collection inspection
+
+    if ! crowdsec_wait_lapi; then
+        fail "CrowdSec LAPI is not ready. Collections were not installed."
+    fi
 
     for collection in crowdsecurity/linux crowdsecurity/traefik; do
         if inspection="$(
             docker exec "${CROWDSEC_CONTAINER}" \
                 cscli collections inspect "${collection}" --no-metrics
-        )"; then
-            if grep -Eq '^installed:[[:space:]]*true$' <<< "${inspection}"; then
-                ok "Collection already installed: ${collection}"
-                continue
-            fi
+        )" && grep -Eq '^installed:[[:space:]]*true$' <<< "${inspection}"; then
+            ok "Collection already installed: ${collection}"
+            continue
         fi
 
-        if docker exec "${CROWDSEC_CONTAINER}" \
+        if ! docker exec "${CROWDSEC_CONTAINER}" \
             cscli collections install "${collection}" >/dev/null; then
-            ok "Collection installed: ${collection}"
-        else
             fail "Unable to install CrowdSec collection ${collection}."
         fi
+
+        inspection="$(
+            docker exec "${CROWDSEC_CONTAINER}" \
+                cscli collections inspect "${collection}" --no-metrics
+        )" || fail "Unable to verify CrowdSec collection ${collection}."
+
+        grep -Eq '^installed:[[:space:]]*true$' <<< "${inspection}" \
+            || fail "CrowdSec collection ${collection} is not installed after installation."
+
+        ok "Collection installed: ${collection}"
     done
 }
 
@@ -827,7 +839,6 @@ post_deploy_crowdsec() {
     if ! crowdsec_wait_lapi; then
         fail "CrowdSec LAPI is not ready. No bouncer was changed."
     fi
-    post_deploy_install_collections
     path="$(post_deploy_bouncer_key_path)"
     key_state="$(post_deploy_key_file_state "${path}")"
     if [[ "${key_state}" == invalid ]]; then

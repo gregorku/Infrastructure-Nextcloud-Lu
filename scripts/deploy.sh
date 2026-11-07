@@ -20,4 +20,5 @@ deploy_check_dockge
 deploy_database_services
 deploy_postgres_role
 deploy_compose
+deploy_crowdsec_install_collections
 print_footer "Deployment completed. Next: ./scripts/post-deploy.sh"
