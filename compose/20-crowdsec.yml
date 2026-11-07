@@ -16,6 +16,7 @@ services:
       - no-new-privileges:true
     environment:
       TZ: ${TZ}
+      COLLECTIONS: "crowdsecurity/linux crowdsecurity/traefik"
     volumes:
       - ../configs/crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro
       - ../configs/crowdsec/profiles.yaml:/etc/crowdsec/profiles.yaml:ro
