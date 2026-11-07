@@ -104,6 +104,8 @@ check_crowdsec_post_deploy() {
     CROWDSEC_TEST_ROOT="$(mktemp -d)"
     eval "$(declare -f crowdsec_probe_once | sed '1s/^crowdsec_probe_once /crowdsec_probe_once_real /')"
     eval "$(declare -f crowdsec_probe_key_file | sed '1s/^crowdsec_probe_key_file /crowdsec_probe_key_file_real /')"
+    eval "$(declare -f crowdsec_wait_lapi | sed '1s/^crowdsec_wait_lapi /crowdsec_wait_lapi_real /')"
+    eval "$(declare -f crowdsec_bouncer_registered | sed '1s/^crowdsec_bouncer_registered /crowdsec_bouncer_registered_real /')"
     expect_crowdsec_action() {
         got="$(post_deploy_crowdsec_action "$1" "$2" "${3:-}")"
         [[ "${got}" == "$4" ]] || crowdsec_static_fail "action ${1}/${2}/${3:-<none>} was ${got}"
@@ -157,12 +159,17 @@ check_crowdsec_post_deploy() {
     if grep -q 'crowdsecurity/sshd' "${REPO_ROOT}/scripts/lib/deploy.sh"; then
         crowdsec_static_fail "post-deploy installs the sshd collection"
     fi
-    grep -q 'GET /v1/decisions HTTP/1.0' "${REPO_ROOT}/scripts/lib/deploy.sh" \
+    grep -q 'HEAD /v1/decisions HTTP/1.0' "${REPO_ROOT}/scripts/lib/deploy.sh" \
         || crowdsec_static_fail "LAPI decision request is missing"
+    if grep -q 'GET /v1/decisions' "${REPO_ROOT}/scripts/lib/deploy.sh"; then
+        crowdsec_static_fail "decisions probe uses GET and would register another bouncer"
+    fi
     grep -q 'Host: crowdsec:8080' "${REPO_ROOT}/scripts/lib/deploy.sh" \
         || crowdsec_static_fail "LAPI host is not crowdsec:8080"
     grep -q 'X-Api-Key: %s' "${REPO_ROOT}/scripts/lib/deploy.sh" \
         || crowdsec_static_fail "LAPI key header is missing"
+    grep -q 'COLLECTIONS: "crowdsecurity/linux crowdsecurity/traefik"' "${REPO_ROOT}/compose/20-crowdsec.yml" \
+        || crowdsec_static_fail "CrowdSec startup collections were removed"
     ok "CrowdSec key is not a host process argument"
 
     crowdsec_keep_loaded() {
@@ -498,6 +505,302 @@ check_crowdsec_post_deploy() {
         crowdsec_static_fail "interrupting the LAPI probe left a temporary key file"
     fi
     ok "CrowdSec removes temporary key files when the probe is interrupted"
+
+    # Models CrowdSec 1.7.8 authPlain: GET with a known key from another IP
+    # appends "<base>@<ip>" once. HEAD only accepts or rejects the key.
+    local lapi_traefik other_key lapi_get lapi_head
+    lapi_traefik='lu-traefik,172.19.0.8,validated,2026-01-01T00:00:00Z,crowdsec-bouncer-traefik-plugin,v1.6.0,api-key'
+    other_key='OTHERFIXTUREKEY0123456789'
+    lapi_get='printf "GET /v1/decisions HTTP/1.0\r\nHost: crowdsec:8080\r\nX-Api-Key: %s\r\nConnection: close\r\n\r\n"'
+    lapi_head='printf "HEAD /v1/decisions HTTP/1.0\r\nHost: crowdsec:8080\r\nX-Api-Key: %s\r\nConnection: close\r\n\r\n"'
+    post_deploy_key_format_ok "${other_key}" \
+        || crowdsec_static_fail "alternate fixture key was rejected"
+    crowdsec_install_lapi_model() {
+        local accepted="$1"
+        rm -rf "${CROWDSEC_TEST_ROOT}/lapi"
+        mkdir -p "${CROWDSEC_TEST_ROOT}/lapi" "${CROWDSEC_TEST_ROOT}/bin" "${CROWDSEC_TEST_ROOT}/tmp"
+        chmod 700 "${CROWDSEC_TEST_ROOT}/lapi" "${CROWDSEC_TEST_ROOT}/bin" "${CROWDSEC_TEST_ROOT}/tmp"
+        printf '%s\n' "${accepted}" > "${CROWDSEC_TEST_ROOT}/lapi/accepted"
+        chmod 600 "${CROWDSEC_TEST_ROOT}/lapi/accepted"
+        : > "${CROWDSEC_TEST_ROOT}/lapi/bouncers"
+        : > "${CROWDSEC_TEST_ROOT}/lapi/methods"
+        chmod 600 "${CROWDSEC_TEST_ROOT}/lapi/bouncers" "${CROWDSEC_TEST_ROOT}/lapi/methods"
+        sed 's/^        //' > "${CROWDSEC_TEST_ROOT}/bin/docker" <<'EOF'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        root="${CROWDSEC_LAPI_MODEL:?}"
+        cmd="$*"
+        if [[ "${cmd}" == *"cscli bouncers list"* ]]; then
+            printf '%s\n' 'name,ip,revoked,last_pull,type,version,auth_type'
+            cat "${root}/bouncers"
+            exit 0
+        fi
+        if [[ "${cmd}" == *"/v1/decisions"* ]]; then
+            method=""
+            if [[ "${cmd}" == *"HEAD /v1/decisions"* ]]; then
+                method=HEAD
+            elif [[ "${cmd}" == *"GET /v1/decisions"* ]]; then
+                method=GET
+            else
+                printf '%s\n' 'HTTP/1.0 400 Bad Request'
+                exit 0
+            fi
+            printf '%s\n' "${method}" >> "${root}/methods"
+            if [[ -f "${root}/decisions-down" ]]; then
+                exit 3
+            fi
+            if [[ -f "${root}/decisions-500" ]]; then
+                printf '%s\n' 'HTTP/1.0 500 Internal Server Error'
+                exit 0
+            fi
+            IFS= read -r key || exit 2
+            accepted="$(<"${root}/accepted")"
+            if [[ "${key}" != "${accepted}" ]]; then
+                printf '%s\n' 'HTTP/1.0 403 Forbidden'
+                exit 0
+            fi
+            if [[ "${method}" == GET ]]; then
+                auto='lu-traefik@172.19.0.2,172.19.0.2,validated,,,,api-key'
+                if ! grep -F -x -q "${auto}" "${root}/bouncers"; then
+                    printf '%s\n' "${auto}" >> "${root}/bouncers"
+                fi
+            fi
+            printf '%s\n' 'HTTP/1.0 200 OK'
+            exit 0
+        fi
+        printf 'unexpected docker command\n' >&2
+        exit 99
+EOF
+        chmod 755 "${CROWDSEC_TEST_ROOT}/bin/docker"
+    }
+    crowdsec_lapi_reset() {
+        printf '%s\n' "${lapi_traefik}" > "${CROWDSEC_TEST_ROOT}/lapi/bouncers"
+        : > "${CROWDSEC_TEST_ROOT}/lapi/methods"
+        rm -f "${CROWDSEC_TEST_ROOT}/lapi/decisions-down" "${CROWDSEC_TEST_ROOT}/lapi/decisions-500"
+    }
+    crowdsec_lapi_assert_traefik_only() {
+        [[ "$(<"${CROWDSEC_TEST_ROOT}/lapi/bouncers")" == "${lapi_traefik}" ]] \
+            || crowdsec_static_fail "$1"
+        if grep -q '^GET$' "${CROWDSEC_TEST_ROOT}/lapi/methods"; then
+            crowdsec_static_fail "$1"
+        fi
+    }
+    crowdsec_lapi_request() {
+        local request="$1" key="$2"
+        printf '%s\n' "${key}" | PATH="${CROWDSEC_TEST_ROOT}/bin:${PATH}" \
+            CROWDSEC_LAPI_MODEL="${CROWDSEC_TEST_ROOT}/lapi" \
+            docker exec -i lu-crowdsec bash -c "${request}"
+    }
+    crowdsec_lapi_probe() {
+        PATH="${CROWDSEC_TEST_ROOT}/bin:${PATH}" \
+        TMPDIR="${CROWDSEC_TEST_ROOT}/tmp" \
+        CROWDSEC_LAPI_MODEL="${CROWDSEC_TEST_ROOT}/lapi" \
+            crowdsec_probe_once_real "$@"
+    }
+    crowdsec_use_real_lapi() {
+        export PATH="${CROWDSEC_TEST_ROOT}/bin:${PATH}"
+        export TMPDIR="${CROWDSEC_TEST_ROOT}/tmp"
+        export CROWDSEC_LAPI_MODEL="${CROWDSEC_TEST_ROOT}/lapi"
+        crowdsec_wait_lapi() { crowdsec_wait_lapi_real; }
+        crowdsec_bouncer_registered() { crowdsec_bouncer_registered_real; }
+        crowdsec_probe_key_file() {
+            CROWDSEC_LAPI_ATTEMPTS=1 CROWDSEC_LAPI_DELAY=0 crowdsec_probe_key_file_real "$@"
+        }
+    }
+
+    crowdsec_install_lapi_model "${CROWDSEC_FIXTURE_KEY}"
+    crowdsec_lapi_reset
+    if grep -F -q "${CROWDSEC_FIXTURE_KEY}" "${CROWDSEC_TEST_ROOT}/bin/docker"; then
+        crowdsec_static_fail "LAPI model stored the API key in the docker command"
+    fi
+    probe_out="$(crowdsec_lapi_request "${lapi_get}" "${CROWDSEC_FIXTURE_KEY}")"
+    [[ "${probe_out}" == "HTTP/1.0 200 OK" ]] || crowdsec_static_fail "GET model did not accept the stored key"
+    grep -F -x -q 'lu-traefik@172.19.0.2,172.19.0.2,validated,,,,api-key' "${CROWDSEC_TEST_ROOT}/lapi/bouncers" \
+        || crowdsec_static_fail "GET model did not reproduce the auto-created bouncer"
+    probe_out="$(crowdsec_lapi_request "${lapi_get}" "${CROWDSEC_FIXTURE_KEY}")"
+    [[ "$(grep -c 'lu-traefik@172.19.0.2,' "${CROWDSEC_TEST_ROOT}/lapi/bouncers")" -eq 1 ]] \
+        || crowdsec_static_fail "repeated GET created more than one auto bouncer"
+    crowdsec_lapi_reset
+    probe_out="$(crowdsec_lapi_request "${lapi_head}" "${CROWDSEC_FIXTURE_KEY}")"
+    [[ "${probe_out}" == "HTTP/1.0 200 OK" ]] || crowdsec_static_fail "HEAD model rejected the stored key"
+    crowdsec_lapi_assert_traefik_only "HEAD check created a bouncer"
+    probe_out="$(crowdsec_lapi_request "${lapi_head}" "${other_key}")"
+    [[ "${probe_out}" == "HTTP/1.0 403 Forbidden" ]] || crowdsec_static_fail "HEAD model accepted an unknown key"
+    crowdsec_lapi_assert_traefik_only "rejected key created a bouncer"
+    crowdsec_lapi_reset
+    crowdsec_prepare_probe_key
+    probe_out="$(crowdsec_lapi_probe "${CROWDSEC_TEST_ROOT}/probe/key")"
+    [[ "${probe_out}" == 200 ]] || crowdsec_static_fail "stored key probe was not accepted"
+    probe_out="$(crowdsec_lapi_probe "${CROWDSEC_TEST_ROOT}/probe/key")"
+    [[ "${probe_out}" == 200 ]] || crowdsec_static_fail "repeated key probe was not accepted"
+    crowdsec_lapi_assert_traefik_only "key probe registered another bouncer"
+    [[ "$(<"${CROWDSEC_TEST_ROOT}/lapi/methods")" == $'HEAD\nHEAD' ]] \
+        || crowdsec_static_fail "key probe did not use HEAD for both checks"
+    printf '%s\n' "${other_key}" > "${CROWDSEC_TEST_ROOT}/probe/other"
+    chmod 600 "${CROWDSEC_TEST_ROOT}/probe/other"
+    probe_out="$(crowdsec_lapi_probe "${CROWDSEC_TEST_ROOT}/probe/other")"
+    [[ "${probe_out}" == 403 ]] || crowdsec_static_fail "unknown key probe was not 403"
+    crowdsec_lapi_assert_traefik_only "unknown key probe registered a bouncer"
+    touch "${CROWDSEC_TEST_ROOT}/lapi/decisions-down"
+    set +e
+    probe_out="$(crowdsec_lapi_probe "${CROWDSEC_TEST_ROOT}/probe/key")"
+    probe_rc=$?
+    set -e
+    [[ "${probe_rc}" -ne 0 ]] || crowdsec_static_fail "unavailable decisions endpoint was accepted"
+    [[ "${probe_out}" != 200 && "${probe_out}" != 403 ]] \
+        || crowdsec_static_fail "unavailable decisions endpoint looked like a key decision"
+    crowdsec_lapi_assert_traefik_only "unavailable decisions endpoint registered a bouncer"
+    rm -f "${CROWDSEC_TEST_ROOT}/lapi/decisions-down"
+    touch "${CROWDSEC_TEST_ROOT}/lapi/decisions-500"
+    probe_out="$(crowdsec_lapi_probe "${CROWDSEC_TEST_ROOT}/probe/key")"
+    [[ "${probe_out}" == 500 ]] || crowdsec_static_fail "LAPI 500 was not reported as 500"
+    crowdsec_lapi_assert_traefik_only "LAPI 500 registered a bouncer"
+    if find "${CROWDSEC_TEST_ROOT}/tmp" -type f -print | grep -q .; then
+        crowdsec_static_fail "LAPI model probe left a temporary key file"
+    fi
+    if grep -F -q -e "${CROWDSEC_FIXTURE_KEY}" -e "${other_key}" \
+        "${CROWDSEC_TEST_ROOT}/lapi/bouncers" "${CROWDSEC_TEST_ROOT}/lapi/methods"; then
+        crowdsec_static_fail "LAPI model wrote an API key into bouncer state"
+    fi
+    ok "CrowdSec key check uses HEAD and does not register another bouncer"
+
+    crowdsec_real_keep_twice() {
+        crowdsec_install_lapi_model "${CROWDSEC_FIXTURE_KEY}"
+        crowdsec_lapi_reset
+        crowdsec_prepare_key "${CROWDSEC_FIXTURE_KEY}"
+        touch -d @5000 "$(crowdsec_key_path)"
+        crowdsec_defaults
+        crowdsec_use_real_lapi
+        traefik_started_raw() { date -u -d @5001 +%Y-%m-%dT%H:%M:%SZ; }
+        post_deploy_crowdsec
+        post_deploy_crowdsec
+    }
+    run_crowdsec crowdsec_real_keep_twice
+    assert_crowdsec_status ok "repeated post-deploy"
+    assert_crowdsec_absent deleted "repeated post-deploy removed lu-traefik"
+    assert_crowdsec_absent added "repeated post-deploy registered another bouncer"
+    assert_crowdsec_absent generated "repeated post-deploy generated a key"
+    assert_crowdsec_absent restart "repeated post-deploy restarted Traefik"
+    crowdsec_lapi_assert_traefik_only "repeated post-deploy registered lu-traefik@<ip>"
+    [[ "$(<"${CROWDSEC_TEST_ROOT}/lapi/methods")" == $'HEAD\nHEAD' ]] \
+        || crowdsec_static_fail "repeated post-deploy did not check the key twice with HEAD"
+    cmp -s "${CROWDSEC_TEST_ROOT}/probe/key" "$(crowdsec_key_path)" \
+        || crowdsec_static_fail "repeated post-deploy replaced the stored key"
+    ok "Repeated post-deploy keeps lu-traefik and does not register another bouncer"
+
+    crowdsec_real_unknown_key() {
+        crowdsec_install_lapi_model "${CROWDSEC_FIXTURE_KEY}"
+        crowdsec_lapi_reset
+        crowdsec_prepare_key "${other_key}"
+        touch -d @5000 "$(crowdsec_key_path)"
+        crowdsec_defaults
+        crowdsec_use_real_lapi
+        traefik_started_raw() { date -u -d @5001 +%Y-%m-%dT%H:%M:%SZ; }
+        post_deploy_crowdsec
+    }
+    run_crowdsec crowdsec_real_unknown_key
+    assert_crowdsec_status ok "unknown key"
+    [[ "$(<"${CROWDSEC_TEST_ROOT}/deleted")" == "${CROWDSEC_BOUNCER_NAME}" ]] \
+        || crowdsec_static_fail "unknown key did not repair lu-traefik"
+    assert_crowdsec_file added
+    assert_crowdsec_absent generated "unknown key generated a replacement"
+    assert_crowdsec_absent restart "unknown key restarted Traefik"
+    crowdsec_lapi_assert_traefik_only "unknown key registered an extra bouncer"
+    cmp -s "${CROWDSEC_TEST_ROOT}/probe/other" "$(crowdsec_key_path)" \
+        || crowdsec_static_fail "unknown key file was replaced"
+    if printf '%s\n' "${CROWDSEC_OUT}" | grep -F -q "${other_key}"; then
+        crowdsec_static_fail "post-deploy printed the rejected API key"
+    fi
+    ok "CrowdSec treats an unknown key as a registration mismatch"
+
+    crowdsec_real_missing_rejected() {
+        crowdsec_install_lapi_model "${CROWDSEC_FIXTURE_KEY}"
+        printf '%s\n' 'other-bouncer,10.0.0.4,validated,,,,api-key' > "${CROWDSEC_TEST_ROOT}/lapi/bouncers"
+        : > "${CROWDSEC_TEST_ROOT}/lapi/methods"
+        crowdsec_prepare_key "${other_key}"
+        touch -d @5000 "$(crowdsec_key_path)"
+        crowdsec_defaults
+        crowdsec_use_real_lapi
+        traefik_started_raw() { date -u -d @5001 +%Y-%m-%dT%H:%M:%SZ; }
+        post_deploy_crowdsec
+    }
+    run_crowdsec crowdsec_real_missing_rejected
+    assert_crowdsec_status ok "missing bouncer and unknown key"
+    assert_crowdsec_file added
+    assert_crowdsec_absent deleted "missing bouncer deleted another name"
+    assert_crowdsec_absent generated "missing bouncer generated a new key"
+    [[ "$(<"${CROWDSEC_TEST_ROOT}/lapi/bouncers")" == 'other-bouncer,10.0.0.4,validated,,,,api-key' ]] \
+        || crowdsec_static_fail "missing registration created an auto bouncer"
+    if grep -q '^GET$' "${CROWDSEC_TEST_ROOT}/lapi/methods"; then
+        crowdsec_static_fail "missing registration checked the key with GET"
+    fi
+    ok "CrowdSec registers a stored key when lu-traefik is absent without an auto bouncer"
+
+    crowdsec_real_missing_accepted() {
+        crowdsec_install_lapi_model "${CROWDSEC_FIXTURE_KEY}"
+        printf '%s\n' 'other-bouncer,10.0.0.4,validated,,,,api-key' > "${CROWDSEC_TEST_ROOT}/lapi/bouncers"
+        : > "${CROWDSEC_TEST_ROOT}/lapi/methods"
+        crowdsec_prepare_key "${CROWDSEC_FIXTURE_KEY}"
+        touch -d @5000 "$(crowdsec_key_path)"
+        crowdsec_defaults
+        crowdsec_use_real_lapi
+        traefik_started_raw() { date -u -d @5001 +%Y-%m-%dT%H:%M:%SZ; }
+        post_deploy_crowdsec
+    }
+    run_crowdsec crowdsec_real_missing_accepted
+    assert_crowdsec_status ok "missing bouncer and accepted key"
+    assert_crowdsec_file added
+    assert_crowdsec_absent deleted "accepted key deleted another bouncer"
+    assert_crowdsec_absent generated "accepted key was regenerated"
+    [[ "$(<"${CROWDSEC_TEST_ROOT}/lapi/bouncers")" == 'other-bouncer,10.0.0.4,validated,,,,api-key' ]] \
+        || crowdsec_static_fail "accepted key without lu-traefik created an auto bouncer"
+    [[ "$(<"${CROWDSEC_TEST_ROOT}/lapi/methods")" == "HEAD" ]] \
+        || crowdsec_static_fail "accepted key was not checked with HEAD"
+    ok "CrowdSec keeps an accepted key and registers only the missing lu-traefik name"
+
+    crowdsec_real_decisions_down() {
+        crowdsec_install_lapi_model "${CROWDSEC_FIXTURE_KEY}"
+        crowdsec_lapi_reset
+        touch "${CROWDSEC_TEST_ROOT}/lapi/decisions-down"
+        crowdsec_prepare_key "${CROWDSEC_FIXTURE_KEY}"
+        crowdsec_defaults
+        crowdsec_use_real_lapi
+        post_deploy_crowdsec
+    }
+    run_crowdsec crowdsec_real_decisions_down
+    assert_crowdsec_status fail "decisions endpoint down"
+    printf '%s\n' "${CROWDSEC_OUT}" | grep -F -q 'did not answer the key check' \
+        || crowdsec_static_fail "unavailable decisions endpoint was not reported as no answer"
+    if printf '%s\n' "${CROWDSEC_OUT}" | grep -F -q '403'; then
+        crowdsec_static_fail "unavailable decisions endpoint was reported as 403"
+    fi
+    assert_crowdsec_absent deleted "unavailable decisions endpoint removed a bouncer"
+    assert_crowdsec_absent added "unavailable decisions endpoint registered a bouncer"
+    assert_crowdsec_absent generated "unavailable decisions endpoint generated a key"
+    assert_crowdsec_absent restart "unavailable decisions endpoint restarted Traefik"
+    crowdsec_lapi_assert_traefik_only "unavailable decisions endpoint changed bouncers"
+    cmp -s "${CROWDSEC_TEST_ROOT}/probe/key" "$(crowdsec_key_path)" \
+        || crowdsec_static_fail "unavailable decisions endpoint replaced the key"
+    ok "CrowdSec does not treat an unreachable LAPI as a bad key"
+
+    crowdsec_real_decisions_500() {
+        crowdsec_install_lapi_model "${CROWDSEC_FIXTURE_KEY}"
+        crowdsec_lapi_reset
+        touch "${CROWDSEC_TEST_ROOT}/lapi/decisions-500"
+        crowdsec_prepare_key "${CROWDSEC_FIXTURE_KEY}"
+        crowdsec_defaults
+        crowdsec_use_real_lapi
+        post_deploy_crowdsec
+    }
+    run_crowdsec crowdsec_real_decisions_500
+    assert_crowdsec_status fail "decisions endpoint 500"
+    printf '%s\n' "${CROWDSEC_OUT}" | grep -F -q 'returned status 500' \
+        || crowdsec_static_fail "LAPI 500 was not kept distinct from a bad key"
+    assert_crowdsec_absent deleted "LAPI 500 removed a bouncer"
+    assert_crowdsec_absent added "LAPI 500 registered a bouncer"
+    assert_crowdsec_absent generated "LAPI 500 generated a key"
+    crowdsec_lapi_assert_traefik_only "LAPI 500 changed bouncers"
+    ok "CrowdSec does not treat LAPI 500 as a bad key"
 
     rm -rf "${CROWDSEC_TEST_ROOT}"
     CROWDSEC_TEST_ROOT=""

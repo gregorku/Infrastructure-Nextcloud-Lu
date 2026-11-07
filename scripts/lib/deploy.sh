@@ -696,12 +696,18 @@ crowdsec_probe_once() {
         return 1
     fi
     command -v timeout >/dev/null 2>&1 || { crowdsec_end_private; return 1; }
+    # CrowdSec 1.7.8 stores "<name>@<client-ip>" with auto_created when a known
+    # API key reads decisions from a new source IP. This check runs inside
+    # lu-crowdsec, so a normal read would register lu-traefik@<crowdsec-ip>
+    # beside the Traefik bouncer. HEAD still authenticates the key and reaches
+    # the decisions handler. It does not create a bouncer or update its IP,
+    # type, version, or last pull. A User-Agent would not stop that registration.
     timeout -k 1 "${timeout_seconds}" \
         docker exec -i "${CROWDSEC_CONTAINER}" \
         bash -c 'IFS= read -r key || exit 2
 [[ -n "${key}" ]] || exit 2
 exec 3<>/dev/tcp/crowdsec/8080 || exit 3
-printf "GET /v1/decisions HTTP/1.0\r\nHost: crowdsec:8080\r\nX-Api-Key: %s\r\nConnection: close\r\n\r\n" "${key}" >&3
+printf "HEAD /v1/decisions HTTP/1.0\r\nHost: crowdsec:8080\r\nX-Api-Key: %s\r\nConnection: close\r\n\r\n" "${key}" >&3
 IFS= read -r line <&3 || exit 4
 printf "%s\n" "${line}"' < "${staged}" > "${out}" &
     crowdsec__priv_child=$!
