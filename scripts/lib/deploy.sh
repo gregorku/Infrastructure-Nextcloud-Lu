@@ -642,14 +642,24 @@ crowdsec_wait_lapi() {
 }
 
 post_deploy_install_collections() {
-    local collection
+    local collection inspection
+
     for collection in crowdsecurity/linux crowdsecurity/traefik; do
-        if docker exec "${CROWDSEC_CONTAINER}" cscli collections inspect "${collection}" >/dev/null 2>&1; then
-            ok "Collection already present: ${collection}"
-        elif docker exec "${CROWDSEC_CONTAINER}" cscli collections install "${collection}" >/dev/null; then
+        if inspection="$(
+            docker exec "${CROWDSEC_CONTAINER}" \
+                cscli collections inspect "${collection}" --no-metrics
+        )"; then
+            if grep -Eq '^installed:[[:space:]]*true$' <<< "${inspection}"; then
+                ok "Collection already installed: ${collection}"
+                continue
+            fi
+        fi
+
+        if docker exec "${CROWDSEC_CONTAINER}" \
+            cscli collections install "${collection}" >/dev/null; then
             ok "Collection installed: ${collection}"
         else
-            fail "Unable to install CrowdSec collection ${collection}. No bouncer was changed."
+            fail "Unable to install CrowdSec collection ${collection}."
         fi
     done
 }
